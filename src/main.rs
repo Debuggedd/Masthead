@@ -2955,7 +2955,7 @@ impl Explorer {
             }
         }
         for revs in out.values_mut() {
-            revs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+            revs.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
         }
         out
     }
