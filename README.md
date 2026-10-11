@@ -65,8 +65,8 @@ and it idles at around 1% CPU.
 
 ## Install
 
-**Download:** grab `Masthead-macos-arm64.zip` from [Releases](https://github.com/Debuggedd/Masthead/releases) (Apple Silicon, macOS 13+),
-unzip it and move `Masthead.app` to Applications. The app isn't notarized, so macOS blocks it the first
+**Download:** grab `Masthead-macos-arm64.dmg` from [Releases](https://github.com/Debuggedd/Masthead/releases) (Apple Silicon, macOS 13+),
+open it and drag Masthead onto Applications. The app isn't notarized, so macOS blocks it the first
 time. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
 
 ```sh
