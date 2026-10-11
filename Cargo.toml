@@ -1,0 +1,47 @@
+[package]
+name = "masthead"
+version = "0.1.0"
+edition = "2024"
+description = "Masthead: a fast, native, multi-cluster Kubernetes explorer for macOS"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Debuggedd/Masthead"
+homepage = "https://github.com/Debuggedd/Masthead"
+keywords = ["kubernetes", "k8s", "gpui", "flux", "macos"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+# runtime_shaders: no Xcode Metal toolchain needed at build time
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# Code editor (InputState::code_editor) + theme. YAML grammar registered by hand to skip the other 27.
+gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
+tree-sitter-yaml = "0.7.1"
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "runtime", "ws"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "io-util"] }
+futures = "0.3"
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+libc = "0.2"
+# Helm stores releases gzip-compressed (already in the build via gpui's dependencies).
+flate2 = "1"
+dirs = "6"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+[lints.rust]
+# objc 0.2's macros emit `cfg(feature = "cargo-clippy")`, which newer rustc warns about.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[lints.clippy]
+# State tuples and render helpers with many inputs are deliberate here; splitting them adds noise.
+type_complexity = "allow"
+too_many_arguments = "allow"

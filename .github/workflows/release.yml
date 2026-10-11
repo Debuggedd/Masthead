@@ -1,0 +1,25 @@
+# Bump `version` in Cargo.toml, then push a matching tag like v0.1.0 to publish Masthead.app (Apple Silicon, ad-hoc signed) as a GitHub release.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The app compares its own version (from Cargo.toml) with the latest tag to offer updates.
+      - name: Tag matches Cargo.toml version
+        run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install librsvg
+      - run: scripts/bundle.sh
+      - run: ditto -c -k --keepParent dist/Masthead.app Masthead-macos-arm64.zip
+      - run: gh release create "$GITHUB_REF_NAME" Masthead-macos-arm64.zip --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

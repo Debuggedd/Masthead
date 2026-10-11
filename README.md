@@ -1,0 +1,201 @@
+<p align="center">
+  <img src="assets/icon.png" width="128" alt="Masthead icon">
+</p>
+
+<h1 align="center">Masthead</h1>
+
+<p align="center">
+  A fast, native, multi-cluster Kubernetes explorer for macOS.<br>
+  Built in Rust with <a href="https://www.gpui.rs">GPUI</a>, the UI framework behind the Zed editor.
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Overview of two clusters">
+</p>
+
+> [!NOTE]
+> **Masthead is entirely AI-coded.** All of the code, scripts, icon and docs were written by
+> [Claude Code](https://claude.com/claude-code) through conversation, with no hand-written code. A human
+> drove it: chose the features, tested them against real clusters and reported what looked or felt wrong.
+> Treat it as an experiment, and read the code before trusting it with a production cluster.
+> Delete and redeploy actions run without a confirmation dialog.
+
+## Why
+
+Tools like Aptakube and Lens are great, but heavy. Masthead is a single ~20 MB native binary, about
+10k lines of Rust. It watches every resource kind of every selected cluster live, so pages switch instantly,
+and it idles at around 1% CPU.
+
+## Features
+
+- **Multi-cluster.** Tick several contexts and their rows merge into one table, with a colour per
+  cluster. Kubeconfig files can be added from the app.
+- **Live everything.** Every kind is kept up to date through Kubernetes watches, with no polling or
+  refresh button.
+- **Overview and Problems.** One card per cluster shows health, capacity, Flux and Helm. The Problems
+  page collects crash-looping pods, failed jobs, unready nodes, broken Flux objects and recent warnings,
+  and can send macOS notifications.
+- **Usage at a glance.** CPU and memory bars show used, requested and limit side by side for pods and
+  nodes, with 15-minute sparklines (needs metrics-server).
+- **⌘P search** across every object in every selected cluster, plus recently opened objects.
+- **Live logs** streamed and merged across all replicas of a workload, with filter, follow, wrap or
+  horizontal scroll, timestamps, the previous container, and a coloured bar for each line's log level.
+- **App map.** Follows Ingress → Service → workload → Pods → ConfigMaps/Secrets/PVCs, and shows missing
+  references in red.
+- **Flux CD aware.** Kustomizations, HelmReleases and sources get their own pages, with conditions,
+  inventory, and reconcile (with source), suspend and resume. Any other CRD shows up too, using its own
+  `kubectl get` columns.
+- **Helm releases.** Lists every release, read straight from Helm's storage, with history, values,
+  chart defaults, the rendered manifest and notes.
+- **Edit YAML** in a syntax-highlighted editor. Saves are conflict-safe.
+- **Actions.** Right-click for delete, rolling redeploy, trigger a CronJob, port forward, open a shell
+  (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
+  multi-selected rows.
+- **Secrets** stay masked until you click the eye icon.
+- **Native feel.** Follows macOS light and dark mode, remembers window position, sorting, sidebar
+  layout, and context and namespace selection.
+
+| | |
+|---|---|
+| ![Pods](docs/screenshots/pods.png) | ![Node detail](docs/screenshots/node.png) |
+| ![App map](docs/screenshots/map.png) | ![Logs](docs/screenshots/logs.png) |
+| ![Flux Kustomization](docs/screenshots/flux.png) | ![Helm releases](docs/screenshots/helm.png) |
+| ![Problems](docs/screenshots/problems.png) | ![⌘P search](docs/screenshots/search.png) |
+| ![Right-click menu](docs/screenshots/menu.png) | ![Dark mode](docs/screenshots/dark.png) |
+
+## Install
+
+**Download:** grab `Masthead-macos-arm64.zip` from [Releases](https://github.com/Debuggedd/Masthead/releases) (Apple Silicon, macOS 13+),
+unzip it and move `Masthead.app` to Applications. The app isn't notarized, so macOS blocks it the first
+time. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Masthead.app
+```
+
+**Updates:** Masthead checks GitHub for a new release on launch and once a day. When one is out, an
+**Update to vX** button appears at the bottom right. It downloads the new version, swaps it in place and
+restarts. To check right away, use Masthead → Check for Updates… or click the version number in the
+bottom right.
+
+**Build from source:** you need macOS 13+ and a recent stable Rust toolchain. You don't need Xcode's
+Metal toolchain, because shaders are compiled at runtime.
+
+```sh
+git clone https://github.com/Debuggedd/Masthead.git && cd Masthead
+scripts/bundle.sh --install     # builds Masthead.app and copies it to ~/Applications
+# or just run it:
+cargo run --release
+```
+
+`rsvg-convert` (`brew install librsvg`) is optional. It renders a sharper app icon from the SVG.
+
+A self-built app is ad-hoc signed, so macOS asks for permissions again after every rebuild, for example
+when a kubeconfig is in `~/Documents`. To keep those permissions across rebuilds, create a code-signing
+certificate called **"Masthead Local Signing"** in Keychain Access (Certificate Assistant → Create a
+Certificate → Code Signing). `bundle.sh` uses it automatically.
+
+## Usage
+
+Masthead reads contexts from `$KUBECONFIG`, or from `~/.kube/config` if that isn't set. Open the
+context switcher at the top left (⌘K) to tick contexts or add more kubeconfig files.
+
+| Key | |
+|---|---|
+| type anywhere | filter the current page (space-separated terms must all match) |
+| ⌘P | search everything |
+| ⌘K | contexts |
+| ↑ ↓ / Enter | select / open |
+| Esc, ⌘[ | back / clear filter / clear selection |
+| ⌘-click, ⇧-click, ⌘A | multi-select rows for bulk actions |
+| ⌘S | save in the YAML editor |
+| ⌘R | reconnect |
+
+Settings are stored in `~/Library/Application Support/Masthead/`.
+
+<details>
+<summary><b>Feature details</b></summary>
+
+- **Contexts**: kubeconfig files added in the context switcher stay where they are; their paths are
+  remembered in `~/Library/Application Support/Masthead/kubeconfigs`. In the file picker, ⌘⇧. shows hidden
+  folders like `~/.kube`. The selection is remembered across restarts.
+- **Resources**: Nodes, Events, Namespaces, Pods, Deployments, StatefulSets, DaemonSets, CronJobs, Jobs,
+  Services, Ingresses, ConfigMaps, Secrets and PVCs, plus every CRD.
+- **Namespace filter** (top right): pick one or more namespaces. Every namespaced page then shows only
+  those; cluster-scoped pages are unaffected.
+- **Sorting**: click a column header. Each page remembers its sort. Events default to newest first, and
+  so do Jobs.
+- **Overview**: Kubernetes version, nodes ready, pods running or failing, deployments ready, Flux and
+  Helm status, error and warning counts, and cluster-wide CPU and memory against allocatable.
+- **Problems**: failing, crash-looping or stuck pods, recent restarts, NotReady or pressured nodes,
+  unavailable workloads, failed jobs, pending or lost PVCs, Flux objects that aren't Ready or are
+  suspended, and warning events from the last 30 minutes. New errors trigger a macOS notification. A
+  cluster's first minute counts as the baseline, so selecting a cluster that already has errors doesn't
+  notify.
+- **Detail pages** have these tabs:
+  - **Overview**: node utilization with the pods on it, containers with usage against request and limit,
+    related pods, events and labels.
+  - **YAML**
+  - **Events**
+  - **Logs**
+  - **Map**
+- **Edit YAML**: line numbers, undo and ⌘F. Saving replaces the object with its resourceVersion, so a
+  concurrent change gives a conflict instead of an overwrite. Unsaved edits stay as drafts.
+- **Port forwards**: a dialog suggests a free local port and offers "open in browser". Services and
+  workloads resolve to a ready pod, like `kubectl` does. Running forwards are listed in the sidebar and
+  end when the app quits.
+- **Shell**: `kubectl exec -it` opens in a new tab of your running Ghostty through its AppleScript API.
+  If Ghostty isn't installed, Terminal.app is used.
+- **Flux**: Reconcile, Reconcile with source (refreshes the GitRepository, OCIRepository, HelmRepository
+  or HelmChart first), Suspend and Resume. Kustomizations and HelmReleases list their managed objects.
+- **Secrets / ConfigMaps**: every key is listed, and values can be selected and scrolled. Secret values
+  re-hide when you move on. You can copy a value without revealing it.
+
+</details>
+
+## Development
+
+```sh
+cargo test                       # unit tests
+cargo test -- --ignored          # live smoke tests against your current context (or MASTHEAD_TEST_CONTEXT)
+```
+
+**Mock clusters for screenshots and demos.** `scripts/demo_cluster.sh` creates two
+[kind](https://kind.sigs.k8s.io) clusters, `staging` and `production`. They run a fake shop app,
+metrics-server, Flux, a Helm release and one deliberately broken deployment. Run the app against them
+with its own `HOME`, so your real contexts and settings stay out of the picture:
+
+```sh
+scripts/demo_cluster.sh                       # needs docker, kind, kubectl, flux
+export HOME=/tmp/masthead-demo KUBECONFIG=/tmp/masthead-demo/kubeconfig
+MASTHEAD_OPEN='Nodes/production-worker#overview' scripts/screenshot.sh out.png 1440x900
+scripts/demo_cluster.sh down
+```
+
+Build the release binary with `cargo build --release` before setting `HOME`, because cargo and rustup
+live in your real home directory.
+
+Debug hooks used by those scripts:
+
+- `MASTHEAD_SIZE=WxH` opens a floating window of that size.
+- `MASTHEAD_OPEN=Kind/name#tab` opens a page. It also accepts `Overview`, `Problems`, `Helm/name`, `Search:query` and `#menu`.
+- `MASTHEAD_KEYS=a,b,cmd-p,wait:500` replays keystrokes.
+- `MASTHEAD_APPEARANCE=dark` forces light or dark mode.
+- `MASTHEAD_RELEASES_URL=file:///path/latest.json` checks a fake release instead of GitHub (tests the updater).
+
+**Layout.** `src/k8s.rs` holds the cluster side: watches, cache, metrics, logs, actions and port
+forwarding. `src/main.rs` holds the whole UI.
+
+**Releases.** Bump `version` in `Cargo.toml`, then push a matching tag such as `v0.2.0`. GitHub
+Actions builds `Masthead.app` and attaches it to a release, and running apps offer it as an update. CI runs `cargo fmt --check`, clippy (warnings are errors) and the tests on every push.
+
+## Built with
+
+- [GPUI](https://www.gpui.rs) and [gpui-component](https://github.com/longbridge/gpui-component)
+- [kube-rs](https://kube.rs) and [k8s-openapi](https://github.com/Arnavion/k8s-openapi)
+- [Lucide](https://lucide.dev) icons
+- [tree-sitter-yaml](https://github.com/tree-sitter-grammars/tree-sitter-yaml)
+
+## License
+
+[MIT](LICENSE). The bundled [Lucide](https://lucide.dev) icons are under the [ISC license](assets/icons/LICENSE).
