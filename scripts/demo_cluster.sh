@@ -170,6 +170,44 @@ spec:
 EOF
 done
 
+# Autoscaling, disruption budgets and namespace guardrails, so those pages aren't empty.
+for c in staging production; do
+  kubectl --context $c apply -f - <<'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: api, namespace: shop}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics: [{type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 80}}}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: api, namespace: shop}
+spec: {minAvailable: 1, selector: {matchLabels: {app: api}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: api-ingress, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: api}}
+  policyTypes: [Ingress]
+  ingress: [{from: [{podSelector: {matchLabels: {app: frontend}}}]}]
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: shop, namespace: shop}
+spec: {hard: {pods: "40", requests.cpu: "4", requests.memory: 8Gi}}
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: defaults, namespace: shop}
+spec:
+  limits: [{type: Container, default: {cpu: 200m, memory: 128Mi}, defaultRequest: {cpu: 20m, memory: 32Mi}}]
+EOF
+done
+
 # Something to show on the Problems page.
 kubectl --context production apply -f - <<'EOF'
 apiVersion: apps/v1

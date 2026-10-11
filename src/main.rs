@@ -142,6 +142,28 @@ const DROP_ORDER: &[&str] = &[
     "Hosts",
     "Type",
     "Schedule",
+    "Min",
+    "Max unavailable",
+    "Current",
+    "Binding",
+    "Reclaim",
+    "Default",
+    "Policy types",
+    "Secrets",
+    "Claim",
+    "Provisioner",
+    "Max",
+    "Min available",
+    "Metrics",
+    "Subjects",
+    "Types",
+    "Rules",
+    "Pod selector",
+    "Used / hard",
+    "Allowed disruptions",
+    "Replicas",
+    "Target",
+    "Role",
     "Pods",
     "Memory",
     "Context",
@@ -186,12 +208,13 @@ fn section_of(ix: usize) -> &'static str {
 /// Height of the transparent titlebar strip (traffic lights live here).
 const TOP: f32 = 44.;
 /// Sidebar group headers: (label, icon, index of the first built-in kind in the group).
-const GROUPS: [(&str, &str, usize); 5] = [
+const GROUPS: [(&str, &str, usize); 6] = [
     ("CLUSTER", "server", 0),
     ("WORKLOADS", "layers", 3),
-    ("NETWORK", "network", 9),
-    ("CONFIG", "sliders-horizontal", 11),
-    ("STORAGE", "archive", 13),
+    ("NETWORK", "network", 10),
+    ("CONFIG", "sliders-horizontal", 13),
+    ("STORAGE", "archive", 19),
+    ("ACCESS CONTROL", "lock", 22),
 ];
 
 /// Icons are embedded so the binary stays self-contained.
@@ -254,6 +277,21 @@ icons!(
     "triangle-alert",
     "circle-check",
     "download",
+    "boxes",
+    "brick-wall",
+    "gauge",
+    "shield",
+    "chart-pie",
+    "ruler",
+    "cylinder",
+    "warehouse",
+    "lock",
+    "bot",
+    "id-card",
+    "link",
+    "badge-check",
+    "link-2",
+    "minus",
 );
 
 struct Assets;
@@ -1184,7 +1222,11 @@ impl Explorer {
             if self.watchers.contains_key(ctx) {
                 continue;
             }
-            let mut handles: HashMap<usize, JoinHandle<()>> = (0..k8s::BUILTIN_COUNT).map(|i| (i, k8s::watch(ctx.clone(), i))).collect();
+            // Lazy built-ins start on first view (watch_current), like CRDs.
+            let mut handles: HashMap<usize, JoinHandle<()>> = (0..k8s::BUILTIN_COUNT)
+                .filter(|&i| !kind_at(i).lazy)
+                .map(|i| (i, k8s::watch(ctx.clone(), i)))
+                .collect();
             handles.insert(METRICS_SLOT, k8s::watch_metrics(ctx.clone()));
             self.watchers.insert(ctx.clone(), handles);
             self.ctx_since.insert(ctx.clone(), Instant::now());
@@ -4864,12 +4906,14 @@ impl Explorer {
         rows.filter(|r| f(r)).cloned().collect()
     }
 
-    /// Link target if that object is in the cache.
+    /// Link target if that object is in the cache. Lazy kinds that haven't loaded yet link anyway; opening
+    /// the page loads them.
     fn link(&self, ctx: &Ctx, kind: usize, ns: &str, name: &str) -> Option<Link> {
         let cache = CACHE.lock().unwrap();
-        let exists = cache
-            .get(&(ctx.clone(), kind))
-            .is_some_and(|s| s.rows.contains_key(&(ns.into(), name.into())));
+        let exists = match cache.get(&(ctx.clone(), kind)) {
+            Some(s) if s.synced => s.rows.contains_key(&(ns.into(), name.into())),
+            _ => kind_at(kind).lazy && !name.is_empty(),
+        };
         exists.then(|| Link::Object(kind, (ctx.clone(), ns.to_string(), name.to_string())))
     }
 
@@ -4886,7 +4930,13 @@ impl Explorer {
             "Nodes" => self.cached(&r.ctx, "Pods", |p| k8s::s(&p.obj, "/spec/nodeName") == r.name),
             "Namespaces" => self.cached(&r.ctx, "Pods", |p| p.ns == r.name),
             "Services" => matching(selector("/spec/selector")?),
-            "Deployments" | "StatefulSets" | "DaemonSets" | "Jobs" => matching(selector("/spec/selector/matchLabels")?),
+            "Deployments" | "StatefulSets" | "DaemonSets" | "Jobs" | "ReplicaSets" | "PDBs" => {
+                matching(selector("/spec/selector/matchLabels")?)
+            }
+            "NetworkPolicies" => matching(selector("/spec/podSelector/matchLabels")?),
+            "ServiceAccounts" => self.cached(&r.ctx, "Pods", |p| {
+                p.ns == r.ns && k8s::s(&p.obj, "/spec/serviceAccountName") == r.name
+            }),
             "PVCs" => self.cached(&r.ctx, "Pods", |p| {
                 p.ns == r.ns
                     && k8s::arr(&p.obj, "/spec/volumes")
@@ -5035,8 +5085,151 @@ impl Explorer {
                 f.push(plain("Capacity", s("/status/capacity/storage")));
                 let modes: Vec<&str> = k8s::arr(o, "/spec/accessModes").iter().filter_map(Value::as_str).collect();
                 f.push(plain("Access modes", modes.join(", ")));
-                f.push(plain("Storage class", s("/spec/storageClassName")));
-                f.push(plain("Volume", s("/spec/volumeName")));
+                let class = s("/spec/storageClassName");
+                f.push((
+                    "Storage class",
+                    class.clone(),
+                    self.link(&r.ctx, kind_ix("StorageClasses"), "", &class),
+                ));
+                let volume = s("/spec/volumeName");
+                f.push(("Volume", volume.clone(), self.link(&r.ctx, kind_ix("PVs"), "", &volume)));
+            }
+            "ReplicaSets" => {
+                f.push(plain("Replicas", format!("{} ready of {} desired", r.cells[2], r.cells[0])));
+                if let Some(owner) = k8s::arr(o, "/metadata/ownerReferences").first() {
+                    let name = k8s::s(owner, "/name");
+                    f.push(("Deployment", name.clone(), self.link(&r.ctx, kind_ix("Deployments"), &r.ns, &name)));
+                }
+                f.push(plain("Revision", s("/metadata/annotations/deployment.kubernetes.io~1revision")));
+                f.push(plain("Images", images("/spec/template/spec/containers")));
+            }
+            "HPAs" => {
+                let (kind, name) = (s("/spec/scaleTargetRef/kind"), s("/spec/scaleTargetRef/name"));
+                let link = kinds()
+                    .iter()
+                    .position(|k| k.kind == kind)
+                    .and_then(|ix| self.link(&r.ctx, ix, &r.ns, &name));
+                f.push(("Target", format!("{kind}/{name}"), link));
+                f.push(plain("Replicas", format!("{} now, {} to {}", r.cells[4], r.cells[2], r.cells[3])));
+                f.push(plain("Desired", s("/status/desiredReplicas")));
+                f.push(plain("Metrics", r.cells[1].replace(", ", "\n")));
+            }
+            "PDBs" => {
+                f.push(plain("Min available", r.cells[0].clone()));
+                f.push(plain("Max unavailable", r.cells[1].clone()));
+                f.push(plain("Allowed disruptions", r.cells[2].clone()));
+                f.push(plain(
+                    "Healthy",
+                    format!("{} of {} expected", s("/status/currentHealthy"), s("/status/expectedPods")),
+                ));
+            }
+            "NetworkPolicies" => {
+                f.push(plain("Pod selector", r.cells[0].clone()));
+                f.push(plain("Policy types", r.cells[1].clone()));
+                f.push(plain("Ingress rules", k8s::arr(o, "/spec/ingress").len().to_string()));
+                f.push(plain("Egress rules", k8s::arr(o, "/spec/egress").len().to_string()));
+            }
+            "ResourceQuotas" => f.push(plain("Used / hard", r.cells[0].replace(", ", "\n"))),
+            "LimitRanges" => {
+                let limits: Vec<String> = k8s::arr(o, "/spec/limits")
+                    .iter()
+                    .map(|l| {
+                        let part = |key: &str| {
+                            let m = l.get(key).and_then(Value::as_object)?;
+                            let v: Vec<String> = m.iter().map(|(k, v)| format!("{k} {}", k8s::s(v, ""))).collect();
+                            Some(format!("{key}: {}", v.join(", ")))
+                        };
+                        let parts: Vec<String> = ["default", "defaultRequest", "min", "max"].iter().filter_map(|k| part(k)).collect();
+                        format!("{} — {}", k8s::s(l, "/type"), parts.join("; "))
+                    })
+                    .collect();
+                f.push(plain("Limits", limits.join("\n")));
+            }
+            "PVs" => {
+                f.push(plain("Status", s("/status/phase")));
+                f.push(plain("Capacity", s("/spec/capacity/storage")));
+                let modes: Vec<&str> = k8s::arr(o, "/spec/accessModes").iter().filter_map(Value::as_str).collect();
+                f.push(plain("Access modes", modes.join(", ")));
+                f.push(plain("Reclaim policy", s("/spec/persistentVolumeReclaimPolicy")));
+                let class = s("/spec/storageClassName");
+                f.push((
+                    "Storage class",
+                    class.clone(),
+                    self.link(&r.ctx, kind_ix("StorageClasses"), "", &class),
+                ));
+                let (cns, claim) = (s("/spec/claimRef/namespace"), s("/spec/claimRef/name"));
+                let label = if claim.is_empty() {
+                    claim.clone()
+                } else {
+                    format!("{cns}/{claim}")
+                };
+                f.push(("Claim", label, self.link(&r.ctx, kind_ix("PVCs"), &cns, &claim)));
+            }
+            "StorageClasses" => {
+                f.push(plain("Provisioner", s("/provisioner")));
+                f.push(plain("Reclaim policy", s("/reclaimPolicy")));
+                f.push(plain("Binding mode", s("/volumeBindingMode")));
+                f.push(plain("Allow expansion", s("/allowVolumeExpansion")));
+                f.push(plain("Default", r.cells[3].clone()));
+                let params: Vec<String> = o
+                    .pointer("/parameters")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, v)| format!("{k}={}", k8s::s(v, "")))
+                    .collect();
+                f.push(plain("Parameters", params.join("\n")));
+            }
+            "ServiceAccounts" => {
+                let names = |p: &str| k8s::arr(o, p).iter().map(|x| k8s::s(x, "/name")).collect::<Vec<_>>().join(", ");
+                f.push(plain("Secrets", names("/secrets")));
+                f.push(plain("Pull secrets", names("/imagePullSecrets")));
+            }
+            "Roles" | "ClusterRoles" => {
+                // One line per rule: verbs on resources (API groups), like `kubectl describe role`.
+                let list = |v: &Value, p: &str| k8s::arr(v, p).iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",");
+                let rules: Vec<String> = k8s::arr(o, "/rules")
+                    .iter()
+                    .map(|rule| {
+                        let groups = list(rule, "/apiGroups");
+                        let what = match (list(rule, "/resources"), list(rule, "/nonResourceURLs")) {
+                            (res, urls) if res.is_empty() => urls,
+                            (res, _) => res,
+                        };
+                        let names = list(rule, "/resourceNames");
+                        format!(
+                            "{} on {what}{}{}",
+                            list(rule, "/verbs"),
+                            if names.is_empty() { String::new() } else { format!(" [{names}]") },
+                            if groups.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  ({groups})")
+                            }
+                        )
+                    })
+                    .collect();
+                f.push(plain("Rules", rules.join("\n")));
+            }
+            "RoleBindings" | "ClusterRoleBindings" => {
+                let (kind, name) = (s("/roleRef/kind"), s("/roleRef/name"));
+                let ix = kind_ix(if kind == "ClusterRole" { "ClusterRoles" } else { "Roles" });
+                let ns = if kind == "Role" { r.ns.clone() } else { String::new() };
+                f.push(("Role", format!("{kind}/{name}"), self.link(&r.ctx, ix, &ns, &name)));
+                // Service accounts link to their page; users and groups are just names.
+                for (i, sub) in k8s::arr(o, "/subjects").iter().enumerate() {
+                    let (kind, name) = (k8s::s(sub, "/kind"), k8s::s(sub, "/name"));
+                    let ns = k8s::s(sub, "/namespace");
+                    let link = (kind == "ServiceAccount")
+                        .then(|| self.link(&r.ctx, kind_ix("ServiceAccounts"), &ns, &name))
+                        .flatten();
+                    let label = if ns.is_empty() {
+                        format!("{kind}/{name}")
+                    } else {
+                        format!("{kind}/{ns}/{name}")
+                    };
+                    f.push((if i == 0 { "Subjects" } else { "" }, label, link));
+                }
             }
             "Namespaces" => f.push(plain("Status", s("/status/phase"))),
             "Events" => {
@@ -7032,7 +7225,10 @@ fn col_width(header: &str) -> Option<f32> {
         "Ready" => 92.,
         "Last seen" => 90.,
         "CPU" | "Memory" => 110.,
-        "Context" | "Namespace" | "Node" | "Object" | "Hosts" | "Roles" => 160.,
+        "Context" | "Namespace" | "Node" | "Object" | "Hosts" | "Roles" | "Target" | "Pod selector" | "Metrics" => 160.,
+        "Role" | "Subjects" | "Claim" | "Provisioner" => 200.,
+        "Used / hard" => 260.,
+        "Min" | "Max" | "Rules" | "Secrets" | "Current" => 76.,
         "Image" => 230.,
         _ => 120.,
     })

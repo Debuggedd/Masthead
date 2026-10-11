@@ -129,7 +129,10 @@ Settings are stored in `~/Library/Application Support/Masthead/`.
   remembered in `~/Library/Application Support/Masthead/kubeconfigs`. In the file picker, ⌘⇧. shows hidden
   folders like `~/.kube`. The selection is remembered across restarts.
 - **Resources**: Nodes, Events, Namespaces, Pods, Deployments, StatefulSets, DaemonSets, CronJobs, Jobs,
-  Services, Ingresses, ConfigMaps, Secrets and PVCs, plus every CRD.
+  ReplicaSets, Services, Ingresses, NetworkPolicies, ConfigMaps, Secrets, HPAs, PDBs, ResourceQuotas,
+  LimitRanges, PVCs, PVs, StorageClasses, ServiceAccounts, Roles, RoleBindings, ClusterRoles and
+  ClusterRoleBindings, plus every CRD. The less common ones (ReplicaSets, NetworkPolicies, quotas, storage
+  and access control) load when you first open them.
 - **Namespace filter** (top right): pick one or more namespaces. Every namespaced page then shows only
   those; cluster-scoped pages are unaffected.
 - **Sorting**: click a column header. Each page remembers its sort. Events default to newest first, and

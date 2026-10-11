@@ -109,6 +109,8 @@ pub struct Kind {
     pub printer: &'static [(&'static str, &'static str)],
     /// A discovered CRD rather than one of the built-in kinds.
     pub custom: bool,
+    /// Built-ins that are only watched once their page is opened (rarely used, or many objects).
+    pub lazy: bool,
 }
 
 const fn k(
@@ -132,6 +134,24 @@ const fn k(
         cols,
         printer: &[],
         custom: false,
+        lazy: false,
+    }
+}
+
+/// A built-in kind that's only watched once its page is opened.
+const fn lazy(
+    name: &'static str,
+    icon: &'static str,
+    group: &'static str,
+    version: &'static str,
+    kind: &'static str,
+    plural: &'static str,
+    namespaced: bool,
+    cols: &'static [&'static str],
+) -> Kind {
+    Kind {
+        lazy: true,
+        ..k(name, icon, group, version, kind, plural, namespaced, cols)
     }
 }
 
@@ -201,6 +221,16 @@ const BUILTIN: &[Kind] = &[
         &["Schedule", "Suspend", "Active"],
     ),
     k("Jobs", "play", "batch", "v1", "Job", "jobs", true, &["Completions", "Status"]),
+    lazy(
+        "ReplicaSets",
+        "boxes",
+        "apps",
+        "v1",
+        "ReplicaSet",
+        "replicasets",
+        true,
+        &["Desired", "Current", "Ready"],
+    ),
     k(
         "Services",
         "share-2",
@@ -221,8 +251,50 @@ const BUILTIN: &[Kind] = &[
         true,
         &["Class", "Hosts"],
     ),
+    lazy(
+        "NetworkPolicies",
+        "brick-wall",
+        "networking.k8s.io",
+        "v1",
+        "NetworkPolicy",
+        "networkpolicies",
+        true,
+        &["Pod selector", "Policy types"],
+    ),
     k("ConfigMaps", "file-text", "", "v1", "ConfigMap", "configmaps", true, &["Keys"]),
     k("Secrets", "key-round", "", "v1", "Secret", "secrets", true, &["Type", "Keys"]),
+    // Watched up front: Scale checks whether an autoscaler owns the replica count.
+    k(
+        "HPAs",
+        "gauge",
+        "autoscaling",
+        "v2",
+        "HorizontalPodAutoscaler",
+        "horizontalpodautoscalers",
+        true,
+        &["Target", "Metrics", "Min", "Max", "Replicas"],
+    ),
+    k(
+        "PDBs",
+        "shield",
+        "policy",
+        "v1",
+        "PodDisruptionBudget",
+        "poddisruptionbudgets",
+        true,
+        &["Min available", "Max unavailable", "Allowed disruptions"],
+    ),
+    lazy(
+        "ResourceQuotas",
+        "chart-pie",
+        "",
+        "v1",
+        "ResourceQuota",
+        "resourcequotas",
+        true,
+        &["Used / hard"],
+    ),
+    lazy("LimitRanges", "ruler", "", "v1", "LimitRange", "limitranges", true, &["Types"]),
     k(
         "PVCs",
         "hard-drive",
@@ -232,6 +304,76 @@ const BUILTIN: &[Kind] = &[
         "persistentvolumeclaims",
         true,
         &["Status", "Capacity", "Class"],
+    ),
+    lazy(
+        "PVs",
+        "cylinder",
+        "",
+        "v1",
+        "PersistentVolume",
+        "persistentvolumes",
+        false,
+        &["Status", "Capacity", "Claim", "Class", "Reclaim"],
+    ),
+    lazy(
+        "StorageClasses",
+        "warehouse",
+        "storage.k8s.io",
+        "v1",
+        "StorageClass",
+        "storageclasses",
+        false,
+        &["Provisioner", "Reclaim", "Binding", "Default"],
+    ),
+    lazy(
+        "ServiceAccounts",
+        "bot",
+        "",
+        "v1",
+        "ServiceAccount",
+        "serviceaccounts",
+        true,
+        &["Secrets"],
+    ),
+    lazy(
+        "Roles",
+        "id-card",
+        "rbac.authorization.k8s.io",
+        "v1",
+        "Role",
+        "roles",
+        true,
+        &["Rules"],
+    ),
+    lazy(
+        "RoleBindings",
+        "link",
+        "rbac.authorization.k8s.io",
+        "v1",
+        "RoleBinding",
+        "rolebindings",
+        true,
+        &["Role", "Subjects"],
+    ),
+    lazy(
+        "ClusterRoles",
+        "badge-check",
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRole",
+        "clusterroles",
+        false,
+        &["Rules"],
+    ),
+    lazy(
+        "ClusterRoleBindings",
+        "link-2",
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRoleBinding",
+        "clusterrolebindings",
+        false,
+        &["Role", "Subjects"],
     ),
 ];
 
@@ -832,6 +974,7 @@ fn register_crd(crd: &CustomResourceDefinition) -> Option<usize> {
         cols: Box::leak(printer.iter().map(|(c, _)| *c).collect::<Vec<_>>().into_boxed_slice()),
         printer: Box::leak(printer.into_boxed_slice()),
         custom: true,
+        lazy: false,
     };
     let mut reg = REGISTRY.write().unwrap();
     reg.push(Box::leak(Box::new(k)));
@@ -968,6 +1111,28 @@ fn len(v: &Value, path: &str) -> String {
     v.pointer(path).and_then(Value::as_object).map_or(0, |m| m.len()).to_string()
 }
 
+/// A scalar as text (strings unquoted).
+fn plain(v: &Value) -> String {
+    s(v, "")
+}
+
+/// A label selector's matchLabels as `k=v,…` (`<all>` when it selects everything).
+fn selector(v: Option<&Value>) -> String {
+    let labels: Vec<String> = v
+        .and_then(|v| v.pointer("/matchLabels"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={}", plain(v)))
+        .collect();
+    let exprs = v.map_or(0, |v| arr(v, "/matchExpressions").len());
+    match (labels.is_empty(), exprs) {
+        (true, 0) => "<all>".into(),
+        (_, 0) => labels.join(","),
+        _ => format!("{}{}+{exprs} expr", labels.join(","), if labels.is_empty() { "" } else { " " }),
+    }
+}
+
 fn cells(kind: &Kind, v: &Value) -> Vec<String> {
     if kind.custom {
         // `kubectl get` columns; Flux-style suspended objects say so instead of a stale Ready.
@@ -1065,6 +1230,104 @@ fn cells(kind: &Kind, v: &Value) -> Vec<String> {
             vec![status.into(), roles.join(",")]
         }
         "Namespace" => vec![s(v, "/status/phase")],
+        "ReplicaSet" => vec![
+            n(v, "/spec/replicas").to_string(),
+            n(v, "/status/replicas").to_string(),
+            n(v, "/status/readyReplicas").to_string(),
+        ],
+        "NetworkPolicy" => {
+            let types: Vec<String> = arr(v, "/spec/policyTypes")
+                .iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect();
+            vec![selector(v.pointer("/spec/podSelector")), types.join(",")]
+        }
+        "HorizontalPodAutoscaler" => {
+            // "cpu 45%/80%" per resource metric, like `kubectl get hpa`.
+            let current = arr(v, "/status/currentMetrics");
+            let metrics: Vec<String> = arr(v, "/spec/metrics")
+                .iter()
+                .filter_map(|m| {
+                    let name = m.pointer("/resource/name")?.as_str()?;
+                    let target = m
+                        .pointer("/resource/target/averageUtilization")
+                        .map(|t| format!("{t}%"))
+                        .or_else(|| m.pointer("/resource/target/averageValue").and_then(Value::as_str).map(String::from))?;
+                    let now = current
+                        .iter()
+                        .find(|c| c.pointer("/resource/name").and_then(Value::as_str) == Some(name))
+                        .and_then(|c| {
+                            c.pointer("/resource/current/averageUtilization")
+                                .map(|u| format!("{u}%"))
+                                .or_else(|| {
+                                    c.pointer("/resource/current/averageValue")
+                                        .and_then(Value::as_str)
+                                        .map(String::from)
+                                })
+                        })
+                        .unwrap_or("?".into());
+                    Some(format!("{name} {now}/{target}"))
+                })
+                .collect();
+            vec![
+                format!("{}/{}", s(v, "/spec/scaleTargetRef/kind"), s(v, "/spec/scaleTargetRef/name")),
+                metrics.join(", "),
+                v.pointer("/spec/minReplicas").map_or("1".into(), |m| m.to_string()),
+                n(v, "/spec/maxReplicas").to_string(),
+                n(v, "/status/currentReplicas").to_string(),
+            ]
+        }
+        "PodDisruptionBudget" => vec![
+            v.pointer("/spec/minAvailable").map(plain).unwrap_or_default(),
+            v.pointer("/spec/maxUnavailable").map(plain).unwrap_or_default(),
+            n(v, "/status/disruptionsAllowed").to_string(),
+        ],
+        "ResourceQuota" => {
+            let used = v.pointer("/status/used");
+            let hard: Vec<String> = v
+                .pointer("/status/hard")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(k, h)| format!("{k} {}/{}", used.and_then(|u| u.get(k)).map(plain).unwrap_or("0".into()), plain(h)))
+                .collect();
+            vec![hard.join(", ")]
+        }
+        "LimitRange" => {
+            let types: Vec<String> = arr(v, "/spec/limits").iter().map(|l| s(l, "/type")).collect();
+            vec![types.join(",")]
+        }
+        "PersistentVolume" => {
+            let claim = match s(v, "/spec/claimRef/name") {
+                c if c.is_empty() => c,
+                c => format!("{}/{c}", s(v, "/spec/claimRef/namespace")),
+            };
+            vec![
+                s(v, "/status/phase"),
+                s(v, "/spec/capacity/storage"),
+                claim,
+                s(v, "/spec/storageClassName"),
+                s(v, "/spec/persistentVolumeReclaimPolicy"),
+            ]
+        }
+        "StorageClass" => {
+            let default = v.pointer("/metadata/annotations/storageclass.kubernetes.io~1is-default-class") == Some(&json!("true"));
+            vec![
+                s(v, "/provisioner"),
+                s(v, "/reclaimPolicy"),
+                s(v, "/volumeBindingMode"),
+                if default { "Yes".into() } else { String::new() },
+            ]
+        }
+        "ServiceAccount" => vec![arr(v, "/secrets").len().to_string()],
+        "Role" | "ClusterRole" => vec![arr(v, "/rules").len().to_string()],
+        "RoleBinding" | "ClusterRoleBinding" => {
+            let subjects: Vec<String> = arr(v, "/subjects")
+                .iter()
+                .map(|s| format!("{}/{}", s["kind"].as_str().unwrap_or(""), s["name"].as_str().unwrap_or("")))
+                .collect();
+            vec![format!("{}/{}", s(v, "/roleRef/kind"), s(v, "/roleRef/name")), subjects.join(", ")]
+        }
         _ => vec![],
     }
 }
@@ -1088,6 +1351,34 @@ mod tests {
             cells(builtin("Service"), &json!({"spec": {"type": "ClusterIP", "ports": [{"port": 80}]}}))[2],
             "80/TCP"
         );
+    }
+
+    #[test]
+    fn more_builtin_cells() {
+        let builtin = |k: &str| BUILTIN.iter().find(|b| b.kind == k).unwrap();
+        let hpa = json!({
+            "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "api"}, "minReplicas": 2, "maxReplicas": 6,
+                "metrics": [{"type": "Resource", "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": 80}}}]},
+            "status": {"currentReplicas": 3, "currentMetrics": [{"type": "Resource", "resource": {"name": "cpu", "current": {"averageUtilization": 45}}}]}
+        });
+        assert_eq!(
+            cells(builtin("HorizontalPodAutoscaler"), &hpa),
+            ["Deployment/api", "cpu 45%/80%", "2", "6", "3"]
+        );
+        let pdb = json!({"spec": {"minAvailable": "50%"}, "status": {"disruptionsAllowed": 1}});
+        assert_eq!(cells(builtin("PodDisruptionBudget"), &pdb), ["50%", "", "1"]);
+        let pv = json!({"spec": {"capacity": {"storage": "2Gi"}, "claimRef": {"namespace": "shop", "name": "data"},
+            "storageClassName": "standard", "persistentVolumeReclaimPolicy": "Delete"}, "status": {"phase": "Bound"}});
+        assert_eq!(
+            cells(builtin("PersistentVolume"), &pv),
+            ["Bound", "2Gi", "shop/data", "standard", "Delete"]
+        );
+        let rb = json!({"roleRef": {"kind": "ClusterRole", "name": "view"}, "subjects": [{"kind": "ServiceAccount", "name": "ci"}]});
+        assert_eq!(cells(builtin("RoleBinding"), &rb), ["ClusterRole/view", "ServiceAccount/ci"]);
+        let np = json!({"spec": {"podSelector": {}, "policyTypes": ["Ingress"]}});
+        assert_eq!(cells(builtin("NetworkPolicy"), &np), ["<all>", "Ingress"]);
+        let quota = json!({"status": {"hard": {"pods": "10"}, "used": {"pods": "3"}}});
+        assert_eq!(cells(builtin("ResourceQuota"), &quota), ["pods 3/10"]);
     }
 
     #[test]
