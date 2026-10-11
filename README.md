@@ -150,10 +150,11 @@ Settings are stored in `~/Library/Application Support/Masthead/`.
 - **Overview**: Kubernetes version, nodes ready, pods running or failing, deployments ready, Flux and
   Helm status, error and warning counts, and cluster-wide CPU and memory against allocatable.
 - **Problems**: failing, crash-looping or stuck pods, recent restarts, NotReady or pressured nodes,
-  unavailable workloads, failed jobs, pending or lost PVCs, Flux objects that aren't Ready or are
-  suspended, and warning events from the last 30 minutes. New errors trigger a macOS notification. A
-  cluster's first minute counts as the baseline, so selecting a cluster that already has errors doesn't
-  notify.
+  unavailable workloads, failed jobs, pending or lost PVCs, Flux objects that have been not Ready for 5
+  minutes or are suspended, and warning events from the last 30 minutes. New errors trigger a macOS
+  notification. A cluster's first minute counts as the baseline, so selecting a cluster that already has
+  errors doesn't notify. Flux's routine blips (a dependent waiting on `DependencyNotReady` while its
+  dependency reconciles) aren't reported; a broken dependency shows up itself.
 - **Detail pages** have these tabs:
   - **Overview**: node utilization with the pods on it, containers with usage against request and limit,
     related pods, events and labels.

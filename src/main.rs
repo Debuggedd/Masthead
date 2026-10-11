@@ -778,6 +778,17 @@ fn row_menu(
     menu
 }
 
+/// A Flux Ready condition that's a real problem. Not-Ready blips are normal: dependents report
+/// DependencyNotReady while their dependency reconciles (every interval), and a reconcile can fail once
+/// and recover. So skip DependencyNotReady (a broken dependency is listed itself) and anything that
+/// hasn't been not-Ready for 5 minutes.
+fn flux_failing(cond: &Value, now: i64) -> bool {
+    cond["type"] == "Ready"
+        && cond["status"] == "False"
+        && cond["reason"] != "DependencyNotReady"
+        && k8s::ts(cond, "/lastTransitionTime").is_some_and(|since| now - since >= 300)
+}
+
 fn suspended(obj: &Value) -> bool {
     obj.pointer("/spec/suspend") == Some(&Value::Bool(true))
 }
@@ -2126,7 +2137,7 @@ impl Explorer {
                     _ => {}
                 }
             }
-            // Flux: not Ready = error, suspended = info.
+            // Flux: not Ready for a while = error (see `flux_failing`), suspended = info.
             for ix in self
                 .available
                 .get(ctx)
@@ -2140,10 +2151,7 @@ impl Explorer {
                         push(2, ix, r, "Suspended".into(), "Reconciliation paused".into(), r.created);
                         continue;
                     }
-                    if let Some(c) = k8s::arr(&r.obj, "/status/conditions")
-                        .iter()
-                        .find(|c| c["type"] == "Ready" && c["status"] == "False")
-                    {
+                    if let Some(c) = k8s::arr(&r.obj, "/status/conditions").iter().find(|c| flux_failing(c, now)) {
                         push(
                             0,
                             ix,
@@ -9499,6 +9507,13 @@ fn kubectl_command_shapes() {
     );
     assert_eq!(short_image("ghcr.io/x/y@sha256:0123456789abcdef0123"), "y@0123456789ab");
     assert!(local_time(1_800_000_000).starts_with("2027-01-15"));
+    let cond =
+        |reason: &str, since: &str| serde_json::json!({"type": "Ready", "status": "False", "reason": reason, "lastTransitionTime": since});
+    let t = |s: &str| s.parse::<k8s_openapi::jiff::Timestamp>().unwrap().as_second();
+    let now = t("2026-10-11T12:10:00Z");
+    assert!(!flux_failing(&cond("DependencyNotReady", "2026-10-11T11:00:00Z"), now));
+    assert!(!flux_failing(&cond("BuildFailed", "2026-10-11T12:08:00Z"), now)); // 2 min: still a blip
+    assert!(flux_failing(&cond("BuildFailed", "2026-10-11T12:04:00Z"), now));
     let f = |q: &str, line: &str| LineFilter::parse(q).unwrap().matches(line);
     assert!(f("", "anything"));
     assert!(f("Order failed", "{\"msg\":\"order FAILED\"}"));
