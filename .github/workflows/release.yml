@@ -17,6 +17,9 @@ jobs:
         run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release  # restores the cache CI saves from main
+          save-if: false
       - run: brew install librsvg
       - run: scripts/bundle.sh
       - run: ditto -c -k --keepParent dist/Masthead.app Masthead-macos-arm64.zip
