@@ -39,6 +39,8 @@ jobs:
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/signing.p12"
       - run: scripts/bundle.sh
+        env:
+          MASTHEAD_RELEASE: "1"
       - name: Signed with the release certificate
         run: codesign -dvv dist/Masthead.app 2>&1 | grep -q "Authority=Masthead Signing"
       - run: ditto -c -k --keepParent dist/Masthead.app Masthead-macos-arm64.zip

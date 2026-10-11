@@ -116,7 +116,7 @@ fn versions() {
     assert!(!newer("0.0.9", "0.1.0"));
 }
 
-/// Full update round trip on a copy of dist/Masthead.app (run scripts/bundle.sh first).
+/// Full update round trip on a copy of dist/Masthead.app (run `MASTHEAD_RELEASE=1 scripts/bundle.sh` first).
 #[test]
 #[ignore]
 fn install_swaps_bundle() {

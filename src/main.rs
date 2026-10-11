@@ -205,6 +205,11 @@ fn section_of(ix: usize) -> &'static str {
     }
 }
 
+/// Builds from the release workflow set MASTHEAD_RELEASE; everything else (cargo run, scripts/bundle.sh) is
+/// a dev build: named "Masthead Dev", orange icon, DEV badge, and no self-updates.
+const DEV: bool = option_env!("MASTHEAD_RELEASE").is_none();
+const APP_NAME: &str = if DEV { "Masthead Dev" } else { "Masthead" };
+
 /// Height of the transparent titlebar strip (traffic lights live here).
 const TOP: f32 = 44.;
 /// Sidebar group headers: (label, icon, index of the first built-in kind in the group).
@@ -1211,7 +1216,8 @@ impl Explorer {
             _poll: poll,
             // Update check shortly after launch, then daily. Screenshot runs skip it unless a test URL is set.
             _update_check: cx.spawn(async move |this, cx| {
-                if std::env::var("MASTHEAD_SIZE").is_ok() && std::env::var("MASTHEAD_RELEASES_URL").is_err() {
+                let test_url = std::env::var("MASTHEAD_RELEASES_URL").is_ok();
+                if (DEV || std::env::var("MASTHEAD_SIZE").is_ok()) && !test_url {
                     return;
                 }
                 cx.background_executor().timer(Duration::from_secs(5)).await;
@@ -1226,12 +1232,15 @@ impl Explorer {
         this
     }
 
-    /// Reads the kubeconfigs off the UI thread, then applies them. Kubeconfigs may live in protected
-    /// folders (Documents, Desktop, …): macOS blocks the read until its permission prompt is answered,
-    /// and a prompt stealing focus while the window is being created deadlocks GPUI 0.2.2
-    /// (`window_did_change_key_status` re-enters itself while holding the window lock).
     /// Looks for a newer release. Manual checks (menu, footer version) report every outcome in the status bar.
     fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if DEV && std::env::var("MASTHEAD_RELEASES_URL").is_err() {
+            if manual {
+                self.status = "This is a dev build, so it doesn't update itself. Releases do.".into();
+                cx.notify();
+            }
+            return;
+        }
         if manual {
             self.status = "Checking for updates…".into();
             cx.notify();
@@ -1288,6 +1297,10 @@ impl Explorer {
         .detach();
     }
 
+    /// Reads the kubeconfigs off the UI thread, then applies them. Kubeconfigs may live in protected
+    /// folders (Documents, Desktop, …): macOS blocks the read until its permission prompt is answered,
+    /// and a prompt stealing focus while the window is being created deadlocks GPUI 0.2.2
+    /// (`window_did_change_key_status` re-enters itself while holding the window lock).
     fn reload_contexts(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let loaded = cx
@@ -7345,6 +7358,17 @@ impl Render for Explorer {
                 .border_color(rgb(ACCENT))
                 .on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
                 .into_any_element(),
+                None if DEV => div()
+                    .id("version")
+                    .flex_none()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(rgb(0xff9e64))
+                    .text_color(rgb(BG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .tooltip(tip(concat!("Dev build of v", env!("CARGO_PKG_VERSION"), " (doesn't self-update)")))
+                    .child("DEV")
+                    .into_any_element(),
                 None => div()
                     .id("version")
                     .cursor_pointer()
@@ -8868,8 +8892,11 @@ fn main() {
     #[cfg(target_os = "macos")]
     keep_awake();
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        // Inside an .app the Dock already shows the bundle's icon (orange for dev builds); `cargo run` has none.
         #[cfg(target_os = "macos")]
-        set_dock_icon();
+        if update::current_app().is_none() {
+            set_dock_icon();
+        }
         gpui_component::init(cx);
         LanguageRegistry::singleton().register(
             "yaml",
@@ -8884,11 +8911,11 @@ fn main() {
         );
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![gpui::Menu {
-            name: "Masthead".into(),
+            name: APP_NAME.into(),
             items: vec![
                 gpui::MenuItem::action("Check for Updates…", CheckForUpdates),
                 gpui::MenuItem::separator(),
-                gpui::MenuItem::action("Quit Masthead", Quit),
+                gpui::MenuItem::action(if DEV { "Quit Masthead Dev" } else { "Quit Masthead" }, Quit),
             ],
         }]);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-p", Search, None)]);
@@ -8924,7 +8951,7 @@ fn main() {
                     gpui::WindowKind::Normal
                 },
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Masthead".into()),
+                    title: Some(APP_NAME.into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(14.), px(15.))),
                 }),
