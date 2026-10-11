@@ -1126,6 +1126,12 @@ impl Explorer {
                     if tick % 20 == 0 && this.sample_stats() {
                         cx.notify();
                     }
+                    if OPEN_PROBLEMS.swap(false, Relaxed) {
+                        (this.problems_mode, this.selected, this.from_problems, this.home_mode) = (true, None, false, false);
+                        (this.helm_mode, this.helm_sel) = (false, None);
+                        this.history.clear();
+                        cx.notify();
+                    }
                     if !this.pending_keys.is_empty() {
                         cx.notify();
                     }
@@ -2668,6 +2674,10 @@ impl Explorer {
                 .hover(|s| s.text_color(rgb(TEXT)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.notify = !this.notify;
+                    #[cfg(target_os = "macos")]
+                    if this.notify {
+                        setup_notifications();
+                    }
                     this.save_settings();
                     cx.notify();
                 }))
@@ -8075,6 +8085,12 @@ fn new_problems<'a>(seen: &std::collections::HashSet<String>, current: &[&'a Pro
 /// Posts a macOS notification via AppleScript: works for a bare binary as well as the .app bundle
 /// (UNUserNotificationCenter needs a signed bundle). Runs off the UI thread.
 fn notify_macos(title: &str, subtitle: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    if native_notify(title, subtitle, body) {
+        return;
+    }
+    // Without an .app bundle (cargo run) there's no native notification center; osascript works but the
+    // notification belongs to Script Editor (clicking it opens that).
     let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "display notification \"{}\" with title \"{}\" subtitle \"{}\" sound name \"Basso\"",
@@ -9094,6 +9110,102 @@ fn set_dock_icon() {
     }
 }
 
+/// Set when a notification is clicked; the poll loop then opens the Problems page.
+static OPEN_PROBLEMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+#[link(name = "UserNotifications", kind = "framework")]
+unsafe extern "C" {}
+
+/// Native notifications through UNUserNotificationCenter, so they come from Masthead (not Script Editor),
+/// show even while Masthead is in front, and open the Problems page when clicked. Needs an .app bundle
+/// (the center throws without a bundle id). Asks for permission once; macOS remembers the answer.
+#[cfg(target_os = "macos")]
+fn setup_notifications() {
+    use objc::{
+        class,
+        declare::ClassDecl,
+        msg_send,
+        runtime::{BOOL, Object, Sel},
+        sel, sel_impl,
+    };
+    static DONE: std::sync::Once = std::sync::Once::new();
+    if update::current_app().is_none() {
+        return;
+    }
+    extern "C" fn clicked(_: &Object, _: Sel, _: *mut Object, _: *mut Object, done: *mut Object) {
+        OPEN_PROBLEMS.store(true, Relaxed);
+        // SAFETY: the system passes a `void (^)(void)` completion block.
+        unsafe { (*(done as *const block::Block<(), ()>)).call(()) }
+    }
+    extern "C" fn present(_: &Object, _: Sel, _: *mut Object, _: *mut Object, done: *mut Object) {
+        // Banner | List | Sound, also while Masthead is the active app.
+        // SAFETY: the system passes a `void (^)(UNNotificationPresentationOptions)` completion block.
+        unsafe { (*(done as *const block::Block<(usize,), ()>)).call((16 | 8 | 2,)) }
+    }
+    DONE.call_once(|| {
+        // SAFETY: standard UserNotifications calls; the delegate is created once and lives for the app's
+        // lifetime (the center only holds it weakly).
+        unsafe {
+            let Some(mut decl) = ClassDecl::new("MastheadNotificationDelegate", class!(NSObject)) else {
+                return;
+            };
+            type Handler = extern "C" fn(&Object, Sel, *mut Object, *mut Object, *mut Object);
+            decl.add_method(
+                sel!(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:),
+                clicked as Handler,
+            );
+            decl.add_method(
+                sel!(userNotificationCenter:willPresentNotification:withCompletionHandler:),
+                present as Handler,
+            );
+            let delegate: *mut Object = msg_send![decl.register(), new];
+            let center: *mut Object = msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
+            let () = msg_send![center, setDelegate: delegate];
+            let asked = block::ConcreteBlock::new(|_: BOOL, _: *mut Object| {}).copy();
+            // Alert | Sound
+            let () = msg_send![center, requestAuthorizationWithOptions: 6usize completionHandler: &*asked];
+        }
+    });
+}
+
+/// Posts a notification through the native center; false when that's unavailable (no .app bundle).
+#[cfg(target_os = "macos")]
+fn native_notify(title: &str, subtitle: &str, body: &str) -> bool {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    if update::current_app().is_none() {
+        return false;
+    }
+    setup_notifications();
+    let text = |s: &str| -> *mut Object {
+        let s = std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
+        // SAFETY: NSString copies the UTF-8 bytes.
+        unsafe { msg_send![class!(NSString), stringWithUTF8String: s.as_ptr()] }
+    };
+    // SAFETY: standard UserNotifications calls; `content` is released after the request copies it.
+    unsafe {
+        let content: *mut Object = msg_send![class!(UNMutableNotificationContent), new];
+        let () = msg_send![content, setTitle: text(title)];
+        let () = msg_send![content, setSubtitle: text(subtitle)];
+        let () = msg_send![content, setBody: text(body)];
+        let sound: *mut Object = msg_send![class!(UNNotificationSound), defaultSound];
+        let () = msg_send![content, setSound: sound];
+        let id = text(&format!(
+            "masthead-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let nil: *mut Object = std::ptr::null_mut();
+        let request: *mut Object = msg_send![class!(UNNotificationRequest), requestWithIdentifier: id content: content trigger: nil];
+        let center: *mut Object = msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
+        let () = msg_send![center, addNotificationRequest: request withCompletionHandler: nil];
+        let () = msg_send![content, release];
+    }
+    true
+}
+
 /// Opts out of App Nap: macOS otherwise throttles timers of apps whose windows aren't visible, which
 /// stalls live updates (and problem notifications) while the app is in the background.
 #[cfg(target_os = "macos")]
@@ -9121,6 +9233,14 @@ fn main() {
             set_dock_icon();
         }
         gpui_component::init(cx);
+        #[cfg(target_os = "macos")]
+        if load_json::<HashMap<String, bool>>("settings.json")
+            .get("notify")
+            .copied()
+            .unwrap_or(true)
+        {
+            setup_notifications();
+        }
         LanguageRegistry::singleton().register(
             "yaml",
             &LanguageConfig::new(

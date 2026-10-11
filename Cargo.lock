@@ -3825,6 +3825,7 @@ name = "masthead"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "block",
  "dirs 6.0.0",
  "flate2",
  "futures",
