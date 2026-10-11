@@ -48,9 +48,10 @@ and it idles at around 1% CPU.
 - **Helm releases.** Lists every release, read straight from Helm's storage, with history, values,
   chart defaults, the rendered manifest and notes.
 - **Edit YAML** in a syntax-highlighted editor. Saves are conflict-safe.
-- **Actions.** Right-click for delete, rolling redeploy, trigger a CronJob, port forward, open a shell
-  (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
-  multi-selected rows.
+- **Actions.** Right-click for delete, rolling redeploy, scale, trigger a CronJob, port forward, open a
+  shell (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
+  multi-selected rows. Workloads have a −/+ replica stepper; ones scaled by an HPA (or KEDA) link to it
+  instead, so you don't fight the autoscaler.
 - **Secrets** stay masked until you click the eye icon.
 - **Native feel.** Follows macOS light and dark mode, remembers window position, sorting, sidebar
   layout, and context and namespace selection.

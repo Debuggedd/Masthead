@@ -356,6 +356,18 @@ enum Action {
     ReconcileWithSource,
     Suspend,
     Resume,
+    /// Change spec.replicas by this much (never below 0).
+    ScaleBy(i64),
+    ScaleTo(i64),
+}
+
+/// Kinds whose replica count can be set directly.
+fn scalable(kind_name: &str) -> bool {
+    matches!(kind_name, "Deployments" | "StatefulSets" | "ReplicaSets")
+}
+
+fn replicas(obj: &Value) -> i64 {
+    obj.pointer("/spec/replicas").and_then(Value::as_i64).unwrap_or(1)
 }
 
 impl Action {
@@ -385,6 +397,10 @@ impl Action {
             Action::ReconcileWithSource => "Reconcile with source",
             Action::Suspend => "Suspend",
             Action::Resume => "Resume",
+            Action::ScaleBy(n) if n > 0 => "Scale up",
+            Action::ScaleBy(_) => "Scale down",
+            Action::ScaleTo(0) => "Scale to 0",
+            Action::ScaleTo(_) => "Scale",
         }
     }
 
@@ -397,6 +413,9 @@ impl Action {
             Action::ReconcileWithSource => "git-branch",
             Action::Suspend => "pause",
             Action::Resume => "play",
+            Action::ScaleBy(n) if n > 0 => "plus",
+            Action::ScaleBy(_) => "minus",
+            Action::ScaleTo(_) => "square",
         }
     }
 
@@ -649,10 +668,38 @@ fn row_menu(
         })
     });
 
-    // Actions, then Delete on its own.
-    let actions: Vec<Action> = Action::quick(k, suspended).into_iter().filter(|a| *a != Action::Delete).collect();
-    if !actions.is_empty() {
+    // Actions, then Delete on its own. Scaling shows the resulting count (or the HPA that owns it).
+    let mut actions: Vec<Action> = Action::quick(k, suspended).into_iter().filter(|a| *a != Action::Delete).collect();
+    let mut autoscaled = None;
+    let mut count = 0;
+    if scalable(k.name)
+        && let Some(v) = view.upgrade()
+    {
+        let this = v.read(cx);
+        count = this.cached_row(kind, &key).map_or(1, |r| replicas(&r.obj));
+        autoscaled = this.autoscaler(kind, &key);
+        if autoscaled.is_none() {
+            actions.push(Action::ScaleBy(1));
+            if count > 0 {
+                actions.extend([Action::ScaleBy(-1), Action::ScaleTo(0)]);
+            } else {
+                actions.push(Action::ScaleTo(1));
+            }
+        }
+    }
+    if !actions.is_empty() || autoscaled.is_some() {
         menu = menu.separator();
+    }
+    if let Some(hpa) = autoscaled {
+        let hpa_key: Key = (hpa.ctx.clone(), hpa.ns.clone(), hpa.name.clone());
+        menu = menu.item(entry(
+            "Autoscaled".into(),
+            format!("HPA {} · {}–{}", hpa.name, hpa.cells[2], hpa.cells[3]),
+            "gauge",
+            DIM,
+            false,
+            Box::new(move |this, _, cx| this.goto(kind_ix("HPAs"), hpa_key.clone(), cx)),
+        ));
     }
     for a in actions.into_iter().chain([Action::Delete]) {
         if a == Action::Delete {
@@ -660,9 +707,18 @@ fn row_menu(
         }
         let key = key.clone();
         let tint = if a == Action::Delete { RED } else { YELLOW };
+        let detail = match a {
+            Action::ScaleBy(d) => format!("→ {}", (count + d).max(0)),
+            Action::ScaleTo(n) if n > 0 => format!("→ {n}"),
+            _ => String::new(),
+        };
         menu = menu.item(entry(
-            a.label().into(),
-            String::new(),
+            if a == Action::ScaleTo(1) {
+                "Scale to 1".into()
+            } else {
+                a.label().into()
+            },
+            detail,
             a.icon(),
             tint,
             a == Action::Delete,
@@ -1696,6 +1752,9 @@ impl Explorer {
         if kind.is_flux() {
             actions.push(Action::Resume);
         }
+        if scalable(kind.name) {
+            actions.extend([Action::ScaleBy(1), Action::ScaleBy(-1), Action::ScaleTo(0)]);
+        }
         actions.push(Action::Delete);
         div()
             .flex()
@@ -2577,6 +2636,56 @@ impl Explorer {
             );
         }
         body
+    }
+
+    /// The HPA that owns this workload's replica count (KEDA works through one too), if any.
+    fn autoscaler(&self, kind: usize, key: &Key) -> Option<Arc<Row>> {
+        let target = kind_at(kind).kind;
+        self.cached(&key.0, "HPAs", |h| {
+            h.ns == key.1 && k8s::s(&h.obj, "/spec/scaleTargetRef/kind") == target && k8s::s(&h.obj, "/spec/scaleTargetRef/name") == key.2
+        })
+        .into_iter()
+        .next()
+    }
+
+    /// Replica stepper for the detail header; an autoscaled workload shows its HPA instead.
+    fn scale_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let row = self.selected_row().filter(|_| scalable(kind_at(self.kind).name))?.clone();
+        let key: Key = (row.ctx.clone(), row.ns.clone(), row.name.clone());
+        if let Some(hpa) = self.autoscaler(self.kind, &key) {
+            let (min, max) = (hpa.cells[2].clone(), hpa.cells[3].clone());
+            let hpa_key: Key = (hpa.ctx.clone(), hpa.ns.clone(), hpa.name.clone());
+            return Some(
+                button("scale-hpa", "gauge", format!("HPA {min}–{max}"), DIM)
+                    .tooltip(tip(format!("Replicas are managed by HPA {}", hpa.name)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.goto(kind_ix("HPAs"), hpa_key.clone(), cx)))
+                    .into_any_element(),
+            );
+        }
+        let n = replicas(&row.obj);
+        let kind = self.kind;
+        let step = |id: &'static str, icon_name: &'static str, delta: i64, label: &'static str| {
+            let key = key.clone();
+            icon_button(id, icon_name, DIM, label)
+                .on_click(cx.listener(move |this, _, _, cx| this.act(Action::ScaleBy(delta), kind, key.clone(), cx)))
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(step("scale-down", "minus", -1, "Scale down"))
+                .child(
+                    div()
+                        .min_w(px(28.))
+                        .text_center()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(n.to_string()),
+                )
+                .child(step("scale-up", "plus", 1, "Scale up"))
+                .into_any_element(),
+        )
     }
 
     fn cached_row(&self, kind: usize, key: &Key) -> Option<Arc<Row>> {
@@ -3959,6 +4068,22 @@ impl Explorer {
             Action::ReconcileWithSource => self.cached_row(kind_ix_, &key).map(|r| flux_sources(&r)).unwrap_or_default(),
             _ => vec![],
         };
+        // Scaling: work out the new count now; an autoscaler owns the count, so leave those alone.
+        let scale_to = match action {
+            Action::ScaleBy(_) | Action::ScaleTo(_) => {
+                if let Some(hpa) = self.autoscaler(kind_ix_, &key) {
+                    self.status = format!("{} is scaled by HPA {}; change the HPA instead", key.2, hpa.name);
+                    return cx.notify();
+                }
+                let current = self.cached_row(kind_ix_, &key).map_or(1, |r| replicas(&r.obj));
+                match action {
+                    Action::ScaleBy(d) => (current + d).max(0),
+                    Action::ScaleTo(n) => n,
+                    _ => unreachable!(),
+                }
+            }
+            _ => 0,
+        };
         let (ctx, ns, name) = key;
         let kind = kind_at(kind_ix_);
         let what = format!("{} {name}", kind.kind.to_lowercase());
@@ -4012,6 +4137,16 @@ impl Explorer {
                 ))
                 .await
                 .map(|_| format!("Suspended {what}")),
+                Action::ScaleBy(_) | Action::ScaleTo(_) => run(k8s::patch(
+                    ctx,
+                    kind,
+                    ns,
+                    name,
+                    serde_json::json!({"spec": {"replicas": scale_to}}),
+                    false,
+                ))
+                .await
+                .map(|_| format!("Scaled {what} to {scale_to}")),
                 Action::Resume => {
                     // Like `flux resume`: unsuspend and ask for a reconcile right away.
                     let mut patch = k8s::reconcile_patch();
@@ -4998,11 +5133,13 @@ impl Explorer {
             }
             "Deployments" => {
                 f.push(plain("Replicas", format!("{} ready", r.cells[0])));
+                f.extend(self.autoscaler_fact(r));
                 f.push(plain("Strategy", s("/spec/strategy/type")));
                 f.push(plain("Images", images("/spec/template/spec/containers")));
             }
             "StatefulSets" => {
                 f.push(plain("Replicas", format!("{} ready", r.cells[0])));
+                f.extend(self.autoscaler_fact(r));
                 f.push(plain("Service", s("/spec/serviceName")));
                 f.push(plain("Images", images("/spec/template/spec/containers")));
             }
@@ -5257,6 +5394,16 @@ impl Explorer {
         f.push(plain("Created", format!("{} ago  ·  {}", k8s::age(created), local_time(created))));
         f.retain(|x| !x.1.is_empty());
         f
+    }
+
+    fn autoscaler_fact(&self, r: &Row) -> Option<Fact> {
+        let hpa = self.autoscaler(self.kind, &(r.ctx.clone(), r.ns.clone(), r.name.clone()))?;
+        let link = self.link(&r.ctx, kind_ix("HPAs"), &hpa.ns, &hpa.name);
+        Some((
+            "Autoscaler",
+            format!("{} ({}–{} replicas, {})", hpa.name, hpa.cells[2], hpa.cells[3], hpa.cells[1]),
+            link,
+        ))
     }
 
     /// What a Flux object points at and what it last applied; sources link to their pages.
@@ -6604,7 +6751,7 @@ impl Explorer {
                                     .min_w_0()
                                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child({
                                         // Title row also holds back/copy/actions/close (26px + gap each).
-                                        let buttons = 3 + Action::quick(kind, false).len();
+                                        let buttons = 3 + Action::quick(kind, false).len() + if scalable(kind.name) { 3 } else { 0 };
                                         let room = self.detail_w - 32. - buttons as f32 * 34.;
                                         // Title is text_base (1rem) vs the table's text_sm, so scale the budget down.
                                         fit_text(window, cx, name, room * 0.875)
@@ -6615,6 +6762,7 @@ impl Explorer {
                                         if ns.is_empty() { "cluster-scoped" } else { &ns }
                                     ))),
                             )
+                            .children(self.scale_control(cx))
                             .child(icon_button("copy", "copy", DIM, "Copy").on_click(cx.listener(|this, _, _, cx| {
                                 let text = match (this.tab, this.current_editor()) {
                                     (Tab::Yaml, Some(ed)) => ed.state.read(cx).value().to_string(),
