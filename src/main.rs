@@ -617,7 +617,8 @@ fn row_menu(
                 GREEN,
                 false,
                 Box::new(move |this, _, cx| {
-                    this.status = open_debug(&ctx2, &ns2, &pod2, &container2);
+                    let profile = this.debug_profile(&ctx2, &ns2);
+                    this.status = open_debug(&ctx2, &ns2, &pod2, &container2, profile);
                     cx.notify();
                 }),
             ));
@@ -2748,6 +2749,21 @@ impl Explorer {
             );
         }
         body
+    }
+
+    /// `kubectl debug` profile the namespace's Pod Security level admits: `general` (adds SYS_PTRACE) only
+    /// where it's explicitly privileged, `restricted` where that's enforced, else `baseline` (clusters
+    /// often enforce baseline by default without labelling namespaces).
+    fn debug_profile(&self, ctx: &Ctx, ns: &str) -> &'static str {
+        let level = self
+            .cached(ctx, "Namespaces", |n| n.name == ns)
+            .first()
+            .map(|n| k8s::s(&n.obj, "/metadata/labels/pod-security.kubernetes.io~1enforce"));
+        match level.as_deref() {
+            Some("privileged") => "general",
+            Some("restricted") => "restricted",
+            _ => "baseline",
+        }
     }
 
     /// The HPA that owns this workload's replica count (KEDA works through one too), if any.
@@ -8484,10 +8500,11 @@ fn open_shell(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
 
 /// `kubectl debug`: an ephemeral busybox container in the pod, sharing the target container's processes
 /// (handy for distroless images without a shell). Ephemeral containers stay listed until the pod restarts.
-fn open_debug(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
+fn open_debug(ctx: &Ctx, ns: &str, pod: &str, container: &str, profile: &str) -> String {
     let image = format!("--image={DEBUG_IMAGE}");
     let target = format!("--target={container}");
-    let args = ["debug", "-it", "-n", ns, pod, &image, &target, "--profile=general", "--", "sh"];
+    let profile = format!("--profile={profile}");
+    let args = ["debug", "-it", "-n", ns, pod, &image, &target, &profile, "--", "sh"];
     match open_kubectl(ctx, &format!("debug {pod} · {}", ctx.name), &args) {
         Ok(()) => format!("Starting a debug container in {pod}…"),
         Err(e) => format!("Debug failed: {e}"),
@@ -8938,7 +8955,7 @@ fn kubectl_commands(k: &Kind, key: &Key, shell: Option<&(String, String)>, port:
             out.push((
                 "Debug container",
                 format!(
-                    "{base} debug -it {} --image={DEBUG_IMAGE} --target={} --profile=general -- sh",
+                    "{base} debug -it {} --image={DEBUG_IMAGE} --target={} --profile=baseline -- sh",
                     q(pod),
                     q(container)
                 ),
