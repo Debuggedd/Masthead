@@ -354,7 +354,7 @@ struct MapNode {
 
 type Key = (Ctx, String, String);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Action {
     Delete,
     Redeploy,
@@ -1011,6 +1011,8 @@ struct Explorer {
     /// The "Port forward" dialog, when open.
     fwd_modal: Option<FwdModal>,
     scale_modal: Option<ScaleModal>,
+    /// Actions sent but not answered yet, so a double click doesn't send them twice.
+    in_flight: std::collections::HashSet<(Action, usize, Key)>,
     /// ⌘P search: the query field (Some = open) and the highlighted result.
     palette: Option<Entity<InputState>>,
     palette_sel: usize,
@@ -1170,6 +1172,7 @@ impl Explorer {
             forwards: vec![],
             fwd_modal: None,
             scale_modal: None,
+            in_flight: Default::default(),
             palette: None,
             palette_sel: 0,
             palette_scroll: gpui::ScrollHandle::new(),
@@ -4448,6 +4451,11 @@ impl Explorer {
             }
             _ => 0,
         };
+        // A second click while the first request is still out does nothing.
+        let pending = (action, kind_ix_, key.clone());
+        if !self.in_flight.insert(pending.clone()) {
+            return;
+        }
         let (ctx, ns, name) = key;
         let kind = kind_at(kind_ix_);
         let what = format!("{} {name}", kind.kind.to_lowercase());
@@ -4521,6 +4529,12 @@ impl Explorer {
                 }
             };
             this.update(cx, |this, cx| {
+                this.in_flight.remove(&pending);
+                // Leave the page of something that's just been deleted (back to the list or previous page).
+                let (_, kind, key) = &pending;
+                if action == Action::Delete && res.is_ok() && this.kind == *kind && this.selected.as_ref() == Some(key) {
+                    this.back(cx);
+                }
                 this.status = match res {
                     Ok(msg) => format!("{msg} ✓"),
                     Err(e) => format!("{} {what} failed: {e:#}", action.label()),
