@@ -790,6 +790,95 @@ pub struct LogLine {
     /// Index into `LogStream::pods`.
     pub pod: usize,
     pub text: String,
+    pub level: Level,
+}
+
+/// Log severity, least to most severe (`None`: the line doesn't say).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Level {
+    #[default]
+    None,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Severity of a log line: JSON/logfmt `level`/`severity` (words or pino numbers), klog's
+/// `E1011 …` prefix, or a bare ERROR/WARN/INFO/DEBUG word near the start. `Level::None` when there's none.
+pub fn log_level(line: &str) -> Level {
+    level_of(line).unwrap_or(Level::None)
+}
+
+fn level_of(line: &str) -> Option<Level> {
+    let word = |w: &str| -> Option<Level> {
+        let w = w
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let pick = |p: &[&str]| p.contains(&w.as_str());
+        Some(
+            if pick(&["err", "error", "fatal", "panic", "crit", "critical", "emerg", "emergency", "alert"]) {
+                Level::Error
+            } else if pick(&["warn", "warning"]) {
+                Level::Warn
+            } else if pick(&["info", "notice"]) {
+                Level::Info
+            } else if pick(&["debug", "trace", "verbose"]) {
+                Level::Debug
+            } else {
+                return None;
+            },
+        )
+    };
+    let head = &line[..line.floor_char_boundary(300)];
+    let lower = head.to_ascii_lowercase();
+    for key in ["\"level\"", "\"severity\"", "\"lvl\"", "level=", "severity=", "lvl="] {
+        if let Some(at) = lower.find(key) {
+            let v = head[at + key.len()..].trim_start_matches([':', ' ', '"']);
+            let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                // pino/bunyan: 10 trace, 20 debug, 30 info, 40 warn, 50 error, 60 fatal
+                return Some(match n {
+                    ..30 => Level::Debug,
+                    30..40 => Level::Info,
+                    40..50 => Level::Warn,
+                    _ => Level::Error,
+                });
+            }
+            if let Some(c) = word(v) {
+                return Some(c);
+            }
+        }
+    }
+    let b = head.as_bytes();
+    if b.len() > 5 && b"IWEF".contains(&b[0]) && b[1..5].iter().all(u8::is_ascii_digit) {
+        return word(match b[0] {
+            b'I' => "info",
+            b'W' => "warn",
+            _ => "error",
+        });
+    }
+    // `fatal: …`, `error: …` as the first word, any case.
+    let t = head.trim_start();
+    let first = t.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    if !first.is_empty()
+        && t[first.len()..].starts_with(':')
+        && let Some(c) = word(first)
+    {
+        return Some(c);
+    }
+    head.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .take(12)
+        .find(|w| {
+            matches!(
+                *w,
+                "ERROR" | "ERR" | "FATAL" | "PANIC" | "WARN" | "WARNING" | "INFO" | "DEBUG" | "TRACE"
+            )
+        })
+        .and_then(word)
 }
 
 /// Live log lines of one container across one or more pods (newest last, capped).
@@ -811,7 +900,16 @@ impl Drop for LogStream {
 const MAX_LOG_LINES: usize = 20_000;
 
 /// Follows logs (`kubectl logs -f`) for each pod; `previous` shows the last crashed container instead.
-pub fn stream_logs(ctx: Ctx, ns: String, pods: Vec<String>, container: Option<String>, previous: bool, timestamps: bool) -> LogStream {
+/// `since`: only lines from the last that many seconds (else the last ~2000 lines).
+pub fn stream_logs(
+    ctx: Ctx,
+    ns: String,
+    pods: Vec<String>,
+    container: Option<String>,
+    previous: bool,
+    timestamps: bool,
+    since: Option<i64>,
+) -> LogStream {
     let lines: Arc<Mutex<std::collections::VecDeque<LogLine>>> = Default::default();
     let version = Arc::new(AtomicU64::new(0));
     // Spread the initial history over the pods.
@@ -828,7 +926,8 @@ pub fn stream_logs(ctx: Ctx, ns: String, pods: Vec<String>, container: Option<St
                     if l.len() >= MAX_LOG_LINES {
                         l.pop_front();
                     }
-                    l.push_back(LogLine { pod: i, text });
+                    let level = log_level(&text);
+                    l.push_back(LogLine { pod: i, text, level });
                     version.fetch_add(1, Ordering::Relaxed);
                 };
                 let res: Result<()> = async {
@@ -839,7 +938,8 @@ pub fn stream_logs(ctx: Ctx, ns: String, pods: Vec<String>, container: Option<St
                         follow: !previous,
                         previous,
                         timestamps,
-                        tail_lines: Some(tail),
+                        tail_lines: if since.is_some() { None } else { Some(tail) },
+                        since_seconds: since,
                         ..Default::default()
                     };
                     let mut stream = api.log_stream(&pod, &lp).await?.lines();
@@ -1351,6 +1451,20 @@ mod tests {
             cells(builtin("Service"), &json!({"spec": {"type": "ClusterIP", "ports": [{"port": 80}]}}))[2],
             "80/TCP"
         );
+    }
+
+    #[test]
+    fn log_levels() {
+        assert_eq!(log_level(r#"{"level":30,"msg":"connected"}"#), Level::Info);
+        assert_eq!(log_level(r#"{"level":"error","msg":"x"}"#), Level::Error);
+        assert_eq!(log_level(r#"{"severity": "WARNING"}"#), Level::Warn);
+        assert_eq!(log_level("ts=1 level=debug msg=hi"), Level::Debug);
+        assert_eq!(log_level("E1011 12:00:00.000 1 reflector.go:1] boom"), Level::Error);
+        assert_eq!(log_level("2026-10-11 12:00:00 WARN disk almost full"), Level::Warn);
+        assert_eq!(log_level("GET /healthz 200"), Level::None);
+        assert_eq!(log_level("fatal: PAYMENTS_TOKEN not set"), Level::Error);
+        assert_eq!(log_level("information: none"), Level::None);
+        assert_eq!(log_level("Information about errors"), Level::None);
     }
 
     #[test]

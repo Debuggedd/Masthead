@@ -902,7 +902,7 @@ struct Problem {
 }
 
 /// (kind, object, container, previous, timestamps): a new stream starts when any of these change.
-type LogKey = (usize, Key, Option<String>, bool, bool);
+type LogKey = (usize, Key, Option<String>, bool, bool, Option<i64>);
 
 struct LogSession {
     key: LogKey,
@@ -992,6 +992,10 @@ struct Explorer {
     log_search: Option<Entity<InputState>>,
     log_scroll: UniformListScrollHandle,
     log_wrap: bool,
+    /// Show only lines at least this severe (`Level::None`: everything).
+    log_min_level: k8s::Level,
+    /// Only the last this many seconds of logs (None: the last ~2000 lines).
+    log_since: Option<i64>,
     /// Visual log rows matching the filter, as (line index, byte range); a wrapped line spans several rows.
     log_view: Vec<(usize, std::ops::Range<usize>)>,
     /// Row of the longest line (sets the scroll width when not wrapping).
@@ -1143,6 +1147,8 @@ impl Explorer {
             alloc: HashMap::new(),
             logs: None,
             log_follow: true,
+            log_min_level: k8s::Level::None,
+            log_since: None,
             log_previous: false,
             log_timestamps: false,
             log_search: None,
@@ -3880,6 +3886,7 @@ impl Explorer {
             container.clone(),
             previous,
             self.log_timestamps,
+            self.log_since,
         );
         if self.logs.as_ref().map(|s| &s.key) != Some(&key) {
             let stream = k8s::stream_logs(
@@ -3889,12 +3896,13 @@ impl Explorer {
                 container,
                 previous,
                 self.log_timestamps,
+                self.log_since,
             );
             self.logs = Some(LogSession { key, stream, seen: 0 });
             self.log_follow = true;
         }
         if self.log_search.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter lines…"));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter… (!exclude, /regex/)"));
             cx.subscribe(&input, |_, _, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify()
@@ -3926,11 +3934,10 @@ impl Explorer {
             usize::MAX
         };
         // Filter, then keep the newest line in view while following.
-        let query = self
-            .log_search
-            .as_ref()
-            .map(|i| i.read(cx).value().to_lowercase())
-            .unwrap_or_default();
+        let query = self.log_search.as_ref().map(|i| i.read(cx).value().to_string()).unwrap_or_default();
+        // An invalid /regex/ shows everything (the toolbar says it's invalid).
+        let filter = LineFilter::parse(&query).unwrap_or_default();
+        let min = self.log_min_level;
         let session = self.logs.as_ref().expect("just ensured");
         let lines = session.stream.lines.lock().unwrap();
         self.log_view.clear();
@@ -3938,7 +3945,7 @@ impl Explorer {
         let mut widest = 0;
         for (i, line) in lines.iter().enumerate() {
             let t = &line.text;
-            if !query.is_empty() && !t.to_lowercase().contains(&query) {
+            if line.level < min || !filter.matches(t) {
                 continue;
             }
             if t.len() > widest {
@@ -3962,6 +3969,34 @@ impl Explorer {
         if self.log_follow && !self.log_view.is_empty() {
             self.log_scroll.scroll_to_item(self.log_view.len() - 1, ScrollStrategy::Bottom);
         }
+    }
+
+    /// Writes the shown (filtered) lines to ~/Downloads and reveals the file in Finder.
+    fn save_logs(&mut self, cx: &mut Context<Self>) {
+        let text = self.log_text();
+        let name = self.selected.as_ref().map_or("logs".to_string(), |k| k.2.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let stamp: String = local_time(now)
+            .chars()
+            .take(19)
+            .map(|c| if c == ' ' || c == ':' { '-' } else { c })
+            .collect();
+        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
+        let path = dir.join(format!("{name}-{stamp}.log"));
+        self.status = match std::fs::write(&path, text + "\n") {
+            Ok(()) => {
+                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                format!(
+                    "Saved {} lines to {}",
+                    self.log_view.iter().filter(|(_, r)| r.start == 0).count(),
+                    path.display()
+                )
+            }
+            Err(e) => format!("Could not save logs: {e}"),
+        };
+        cx.notify();
     }
 
     /// The filtered log lines as text (for Copy).
@@ -3988,6 +4023,66 @@ impl Explorer {
         };
         let rows = self.log_view.len();
         let shown = self.log_view.iter().filter(|(_, r)| r.start == 0).count();
+        let query = self.log_search.as_ref().map(|i| i.read(cx).value().to_string()).unwrap_or_default();
+        let bad_regex = LineFilter::parse(&query).is_err();
+        // A small segmented control: one chip per choice, the current one highlighted.
+        let segment = |id: &'static str, chips: Vec<(&'static str, bool, Box<dyn Fn(&mut Self)>)>, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .p_0p5()
+                .rounded_md()
+                .bg(rgb(SURFACE))
+                .children(chips.into_iter().enumerate().map(move |(i, (label, on, pick))| {
+                    div()
+                        .id((id, i))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(if on { TEXT } else { DIM }))
+                        .when(on, |d| d.bg(rgb(SELECT)))
+                        .when(!on, |d| d.hover(|s| s.text_color(rgb(TEXT))))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            pick(this);
+                            cx.notify();
+                        }))
+                        .child(label)
+                }))
+        };
+        let level = self.log_min_level;
+        let levels = segment(
+            "log-level",
+            [
+                ("All", k8s::Level::None),
+                ("Warnings", k8s::Level::Warn),
+                ("Errors", k8s::Level::Error),
+            ]
+            .into_iter()
+            .map(|(label, l)| {
+                (
+                    label,
+                    level == l,
+                    Box::new(move |this: &mut Self| this.log_min_level = l) as Box<dyn Fn(&mut Self)>,
+                )
+            })
+            .collect(),
+            cx,
+        );
+        let since = self.log_since;
+        let since_chips = segment(
+            "log-since",
+            [("Recent", None), ("5m", Some(300)), ("1h", Some(3600)), ("24h", Some(86400))]
+                .into_iter()
+                .map(|(label, s)| {
+                    (
+                        label,
+                        since == s,
+                        Box::new(move |this: &mut Self| this.log_since = s) as Box<dyn Fn(&mut Self)>,
+                    )
+                })
+                .collect(),
+            cx,
+        );
         div()
             .flex_1()
             .min_h_0()
@@ -4047,12 +4142,20 @@ impl Explorer {
                             })),
                         )
                     })
+                    .child(levels)
+                    .child(since_chips)
                     .child(div().flex_1())
+                    .when(bad_regex, |d| d.child(div().text_color(rgb(RED)).child("invalid regex")))
                     .child(div().text_color(rgb(FAINT)).child(match (shown == total, pods.len()) {
                         (true, 1) => format!("{total} lines"),
                         (true, n) => format!("{total} lines · {n} pods"),
                         (false, _) => format!("{shown} of {total} lines"),
-                    })),
+                    }))
+                    .child(
+                        button("log-save", "download", "Save", DIM)
+                            .tooltip(tip("Save the shown lines to Downloads"))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_logs(cx))),
+                    ),
             )
             .child(if pods.is_empty() {
                 div()
@@ -4102,7 +4205,7 @@ impl Explorer {
                                                 .flex_none()
                                                 .w(px(3.))
                                                 .h_full()
-                                                .when_some(log_level(&line.text), |d, c| d.bg(rgb(c))),
+                                                .when_some(severity_color(line.level), |d, c| d.bg(rgb(c))),
                                         )
                                         .when(many, |d| {
                                             d.child(
@@ -8638,77 +8741,58 @@ fn kubectl_commands(k: &Kind, key: &Key, shell: Option<&(String, String)>, port:
 }
 
 /// "registry.gitlab.com/org/repo/api:1.2.3" → "api:1.2.3"; digests shortened to 12 hex chars.
-/// Severity color for a log line: JSON/logfmt `level`/`severity` (words or pino numbers), klog's
-/// `E1011 …` prefix, or a bare ERROR/WARN/INFO/DEBUG word near the start. None when there's no level.
-fn log_level(line: &str) -> Option<u32> {
-    let word = |w: &str| -> Option<u32> {
-        let w = w
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let pick = |p: &[&str]| p.contains(&w.as_str());
-        Some(
-            if pick(&["err", "error", "fatal", "panic", "crit", "critical", "emerg", "emergency", "alert"]) {
-                RED
-            } else if pick(&["warn", "warning"]) {
-                YELLOW
-            } else if pick(&["info", "notice"]) {
-                ACCENT
-            } else if pick(&["debug", "trace", "verbose"]) {
-                FAINT
-            } else {
-                return None;
-            },
-        )
-    };
-    let head = &line[..line.floor_char_boundary(300)];
-    let lower = head.to_ascii_lowercase();
-    for key in ["\"level\"", "\"severity\"", "\"lvl\"", "level=", "severity=", "lvl="] {
-        if let Some(at) = lower.find(key) {
-            let v = head[at + key.len()..].trim_start_matches([':', ' ', '"']);
-            let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
-            if let Ok(n) = digits.parse::<u32>() {
-                // pino/bunyan: 10 trace, 20 debug, 30 info, 40 warn, 50 error, 60 fatal
-                return Some(match n {
-                    ..30 => FAINT,
-                    30..40 => ACCENT,
-                    40..50 => YELLOW,
-                    _ => RED,
-                });
-            }
-            if let Some(c) = word(v) {
-                return Some(c);
-            }
+/// The log filter box: `/regex/` (case-insensitive), else space-separated words that must all appear
+/// (`!word`: must not), ignoring case.
+#[derive(Default)]
+struct LineFilter {
+    regex: Option<regex::Regex>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl LineFilter {
+    fn parse(query: &str) -> Result<Self, regex::Error> {
+        if let Some(p) = query.strip_prefix('/').and_then(|q| q.strip_suffix('/')).filter(|p| !p.is_empty()) {
+            let re = regex::RegexBuilder::new(p).case_insensitive(true).build()?;
+            return Ok(Self {
+                regex: Some(re),
+                ..Default::default()
+            });
         }
-    }
-    let b = head.as_bytes();
-    if b.len() > 5 && b"IWEF".contains(&b[0]) && b[1..5].iter().all(u8::is_ascii_digit) {
-        return word(match b[0] {
-            b'I' => "info",
-            b'W' => "warn",
-            _ => "error",
-        });
-    }
-    // `fatal: …`, `error: …` as the first word, any case.
-    let t = head.trim_start();
-    let first = t.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-    if !first.is_empty()
-        && t[first.len()..].starts_with(':')
-        && let Some(c) = word(first)
-    {
-        return Some(c);
-    }
-    head.split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|w| !w.is_empty())
-        .take(12)
-        .find(|w| {
-            matches!(
-                *w,
-                "ERROR" | "ERR" | "FATAL" | "PANIC" | "WARN" | "WARNING" | "INFO" | "DEBUG" | "TRACE"
-            )
+        let (exclude, include): (Vec<String>, Vec<String>) = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .partition(|w| w.starts_with('!'));
+        let exclude = exclude.into_iter().map(|w| w[1..].to_string()).filter(|w| !w.is_empty()).collect();
+        Ok(Self {
+            regex: None,
+            include,
+            exclude,
         })
-        .and_then(word)
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        if let Some(re) = &self.regex {
+            return re.is_match(text);
+        }
+        if self.include.is_empty() && self.exclude.is_empty() {
+            return true;
+        }
+        let t = text.to_lowercase();
+        self.include.iter().all(|w| t.contains(w.as_str())) && !self.exclude.iter().any(|w| t.contains(w.as_str()))
+    }
+}
+
+/// Bar color for a log line's level.
+fn severity_color(level: k8s::Level) -> Option<u32> {
+    match level {
+        k8s::Level::None => None,
+        k8s::Level::Debug => Some(FAINT),
+        k8s::Level::Info => Some(ACCENT),
+        k8s::Level::Warn => Some(YELLOW),
+        k8s::Level::Error => Some(RED),
+    }
 }
 
 fn short_image(image: &str) -> String {
@@ -9173,16 +9257,14 @@ fn kubectl_command_shapes() {
     );
     assert_eq!(short_image("ghcr.io/x/y@sha256:0123456789abcdef0123"), "y@0123456789ab");
     assert!(local_time(1_800_000_000).starts_with("2027-01-15"));
-    assert_eq!(log_level(r#"{"level":30,"msg":"connected"}"#), Some(ACCENT));
-    assert_eq!(log_level(r#"{"level":"error","msg":"x"}"#), Some(RED));
-    assert_eq!(log_level(r#"{"severity": "WARNING"}"#), Some(YELLOW));
-    assert_eq!(log_level("ts=1 level=debug msg=hi"), Some(FAINT));
-    assert_eq!(log_level("E1011 12:00:00.000 1 reflector.go:1] boom"), Some(RED));
-    assert_eq!(log_level("2026-10-11 12:00:00 WARN disk almost full"), Some(YELLOW));
-    assert_eq!(log_level("GET /healthz 200"), None);
-    assert_eq!(log_level("fatal: PAYMENTS_TOKEN not set"), Some(RED));
-    assert_eq!(log_level("information: none"), None);
-    assert_eq!(log_level("Information about errors"), None);
+    let f = |q: &str, line: &str| LineFilter::parse(q).unwrap().matches(line);
+    assert!(f("", "anything"));
+    assert!(f("Order failed", "{\"msg\":\"order FAILED\"}"));
+    assert!(!f("order !failed", "order failed"));
+    assert!(f("order !failed", "order processed"));
+    assert!(f("/order (failed|slow)/", "ORDER SLOW: 1400ms"));
+    assert!(!f("/^order/", "an order"));
+    assert!(LineFilter::parse("/(unclosed/").is_err());
 }
 
 /// App map from a real Ingress (MASTHEAD_TEST_CONTEXT, default the current context; MASTHEAD_TEST_INGRESS, default shop as in scripts/demo_cluster.sh).

@@ -38,8 +38,10 @@ and it idles at around 1% CPU.
 - **Usage at a glance.** CPU and memory bars show used, requested and limit side by side for pods and
   nodes, with 15-minute sparklines (needs metrics-server).
 - **⌘P search** across every object in every selected cluster, plus recently opened objects.
-- **Live logs** streamed and merged across all replicas of a workload, with filter, follow, wrap or
-  horizontal scroll, timestamps, the previous container, and a coloured bar for each line's log level.
+- **Live logs** streamed and merged across all replicas of a workload, with follow, wrap or horizontal
+  scroll, timestamps, the previous container, and a coloured bar for each line's log level. Show only
+  warnings or errors, load the last 5m/1h/24h, filter with words (`!word` excludes) or a `/regex/`, and
+  save what's shown to Downloads.
 - **App map.** Follows Ingress → Service → workload → Pods → ConfigMaps/Secrets/PVCs, and shows missing
   references in red.
 - **Flux CD aware.** Kustomizations, HelmReleases and sources get their own pages, with conditions,
