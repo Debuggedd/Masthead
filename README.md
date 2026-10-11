@@ -52,8 +52,8 @@ and it idles at around 1% CPU.
 - **Edit YAML** in a syntax-highlighted editor. Saves are conflict-safe.
 - **Actions.** Right-click for delete, rolling redeploy, scale, trigger a CronJob, port forward, open a
   shell (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
-  multi-selected rows. Workloads have a −/+ replica stepper; ones scaled by an HPA (or KEDA) link to it
-  instead, so you don't fight the autoscaler.
+  multi-selected rows. Scale opens a small dialog for the replica count; workloads scaled by an HPA (or
+  KEDA) link to it instead, so you don't fight the autoscaler.
 - **Protected contexts.** Click the lock next to a context in the switcher (⌘K) to turn off deletes,
   scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work. Handy for
   production, since actions don't ask for confirmation.
@@ -98,10 +98,14 @@ Metal toolchain, because shaders are compiled at runtime.
 
 ```sh
 git clone https://github.com/Debuggedd/Masthead.git && cd Masthead
-scripts/bundle.sh --install     # builds Masthead.app and copies it to ~/Applications
+scripts/bundle.sh --install     # builds "Masthead Dev.app" and copies it to ~/Applications
 # or just run it:
 cargo run --release
 ```
+
+Local builds are dev builds: named "Masthead Dev" with an orange icon and a DEV badge, and they don't
+update themselves, so they can run next to an installed release without mixing them up. Only the
+release workflow builds `Masthead.app` (it sets `MASTHEAD_RELEASE=1`).
 
 `rsvg-convert` (`brew install librsvg`) is optional. It renders a sharper app icon from the SVG.
 
