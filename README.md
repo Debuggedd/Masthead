@@ -65,13 +65,22 @@ and it idles at around 1% CPU.
 
 ## Install
 
-**Download:** grab `Masthead-macos-arm64.dmg` from [Releases](https://github.com/Debuggedd/Masthead/releases) (Apple Silicon, macOS 13+),
-open it and drag Masthead onto Applications. The app isn't notarized, so macOS blocks it the first
-time. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
+**Download** (Apple Silicon, macOS 13+):
+
+1. Grab `Masthead-macos-arm64.dmg` from the [latest release](https://github.com/Debuggedd/Masthead/releases/latest),
+   open it and drag Masthead onto Applications.
+2. Open Masthead. macOS says *"Masthead" Not Opened*, because the app isn't notarized by Apple.
+   Click **Done**, not "Move to Bin".
+3. Open **System Settings → Privacy & Security**, scroll down to *"Masthead" was blocked…*, click
+   **Open Anyway** and confirm.
+
+Or skip steps 2 and 3 with one Terminal command:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/Masthead.app
 ```
+
+This is only needed once. Updates install from inside the app and open without the warning.
 
 **Updates:** Masthead checks GitHub for a new release on launch and once a day. When one is out, an
 **Update to vX** button appears at the bottom right. It downloads the new version, swaps it in place and

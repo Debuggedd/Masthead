@@ -46,6 +46,7 @@ jobs:
         run: |
           mkdir dmg && ditto dist/Masthead.app dmg/Masthead.app && ln -s /Applications dmg/Applications
           hdiutil create -volname Masthead -srcfolder dmg -ov -format UDZO Masthead-macos-arm64.dmg
-      - run: gh release create "$GITHUB_REF_NAME" Masthead-macos-arm64.dmg Masthead-macos-arm64.zip --generate-notes
+      # Install steps (incl. getting past Gatekeeper) on top, then GitHub's generated changelog.
+      - run: gh release create "$GITHUB_REF_NAME" Masthead-macos-arm64.dmg Masthead-macos-arm64.zip --notes "$(cat .github/release-notes.md)" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
