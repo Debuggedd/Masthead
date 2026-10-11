@@ -298,6 +298,7 @@ icons!(
     "link-2",
     "minus",
     "bug",
+    "arrow-up-down",
 );
 
 struct Assets;
@@ -362,8 +363,7 @@ enum Action {
     ReconcileWithSource,
     Suspend,
     Resume,
-    /// Change spec.replicas by this much (never below 0).
-    ScaleBy(i64),
+    /// Set spec.replicas (from the Scale dialog).
     ScaleTo(i64),
 }
 
@@ -403,9 +403,6 @@ impl Action {
             Action::ReconcileWithSource => "Reconcile with source",
             Action::Suspend => "Suspend",
             Action::Resume => "Resume",
-            Action::ScaleBy(n) if n > 0 => "Scale up",
-            Action::ScaleBy(_) => "Scale down",
-            Action::ScaleTo(0) => "Scale to 0",
             Action::ScaleTo(_) => "Scale",
         }
     }
@@ -419,9 +416,7 @@ impl Action {
             Action::ReconcileWithSource => "git-branch",
             Action::Suspend => "pause",
             Action::Resume => "play",
-            Action::ScaleBy(n) if n > 0 => "plus",
-            Action::ScaleBy(_) => "minus",
-            Action::ScaleTo(_) => "square",
+            Action::ScaleTo(_) => "arrow-up-down",
         }
     }
 
@@ -722,17 +717,21 @@ fn row_menu(
         let this = v.read(cx);
         count = this.cached_row(kind, &key).map_or(1, |r| replicas(&r.obj));
         autoscaled = this.autoscaler(kind, &key);
-        if autoscaled.is_none() {
-            actions.push(Action::ScaleBy(1));
-            if count > 0 {
-                actions.extend([Action::ScaleBy(-1), Action::ScaleTo(0)]);
-            } else {
-                actions.push(Action::ScaleTo(1));
-            }
-        }
     }
-    if !actions.is_empty() || autoscaled.is_some() {
+    let can_scale = scalable(k.name) && !locked && autoscaled.is_none();
+    if !actions.is_empty() || autoscaled.is_some() || can_scale {
         menu = menu.separator();
+    }
+    if can_scale {
+        let key = key.clone();
+        menu = menu.item(entry(
+            "Scale…".into(),
+            format!("{count} replica{}", if count == 1 { "" } else { "s" }),
+            "arrow-up-down",
+            YELLOW,
+            false,
+            Box::new(move |this, _, cx| this.open_scale_modal(kind, vec![key.clone()], cx)),
+        ));
     }
     if let Some(hpa) = autoscaled {
         let hpa_key: Key = (hpa.ctx.clone(), hpa.ns.clone(), hpa.name.clone());
@@ -766,18 +765,9 @@ fn row_menu(
         }
         let key = key.clone();
         let tint = if a == Action::Delete { RED } else { YELLOW };
-        let detail = match a {
-            Action::ScaleBy(d) => format!("→ {}", (count + d).max(0)),
-            Action::ScaleTo(n) if n > 0 => format!("→ {n}"),
-            _ => String::new(),
-        };
         menu = menu.item(entry(
-            if a == Action::ScaleTo(1) {
-                "Scale to 1".into()
-            } else {
-                a.label().into()
-            },
-            detail,
+            a.label().into(),
+            String::new(),
             a.icon(),
             tint,
             a == Action::Delete,
@@ -827,6 +817,16 @@ struct FwdTarget {
 }
 
 /// Port-forward dialog state (Aptakube-style: local port → container port dropdown, open-in-browser).
+/// The Scale dialog: one object, or every picked row (then `current` is None).
+struct ScaleModal {
+    kind: usize,
+    keys: Vec<Key>,
+    current: Option<i64>,
+    input: Option<Entity<InputState>>,
+    focus: bool,
+    error: Option<String>,
+}
+
 struct FwdModal {
     row: Arc<Row>,
     /// Selected index into `forward_targets(row)`.
@@ -1010,6 +1010,7 @@ struct Explorer {
     forwards: Vec<FwdEntry>,
     /// The "Port forward" dialog, when open.
     fwd_modal: Option<FwdModal>,
+    scale_modal: Option<ScaleModal>,
     /// ⌘P search: the query field (Some = open) and the highlighted result.
     palette: Option<Entity<InputState>>,
     palette_sel: usize,
@@ -1168,6 +1169,7 @@ impl Explorer {
             picker_open: false,
             forwards: vec![],
             fwd_modal: None,
+            scale_modal: None,
             palette: None,
             palette_sel: 0,
             palette_scroll: gpui::ScrollHandle::new(),
@@ -1663,6 +1665,11 @@ impl Explorer {
                     self.open_fwd_modal(r.clone(), 0, cx);
                     Tab::Overview
                 }
+                "scale" => {
+                    // Dev hook for screenshots: open the Scale dialog.
+                    self.open_scale_modal(self.kind, vec![key.clone()], cx);
+                    Tab::Overview
+                }
                 "forward!" => {
                     // Dev hook for screenshots: start forwarding the first port (never opens the browser).
                     if let Some(t) = self.forward_targets(&r.clone()).into_iter().next() {
@@ -1838,10 +1845,13 @@ impl Explorer {
         if kind.is_flux() {
             actions.push(Action::Resume);
         }
-        if scalable(kind.name) {
-            actions.extend([Action::ScaleBy(1), Action::ScaleBy(-1), Action::ScaleTo(0)]);
-        }
         actions.push(Action::Delete);
+        let scale = scalable(kind.name).then(|| {
+            button("bulk-scale", "arrow-up-down", "Scale…", DIM).on_click(cx.listener(|this, _, _, cx| {
+                let keys: Vec<Key> = this.picked.iter().cloned().collect();
+                this.open_scale_modal(this.kind, keys, cx);
+            }))
+        });
         div()
             .flex()
             .flex_none()
@@ -1880,6 +1890,7 @@ impl Explorer {
                 )
             })
             .child(div().flex_1())
+            .children(scale)
             .children(actions.into_iter().enumerate().map(|(i, a)| {
                 button(("bulk", i), a.icon(), a.label(), if a == Action::Delete { RED } else { DIM })
                     .on_click(cx.listener(move |this, _, _, cx| this.bulk(a, cx)))
@@ -2746,7 +2757,7 @@ impl Explorer {
         .next()
     }
 
-    /// Replica stepper for the detail header; an autoscaled workload shows its HPA instead.
+    /// Scale button for the detail header (opens the Scale dialog); an autoscaled workload shows its HPA.
     fn scale_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let row = self.selected_row().filter(|_| scalable(kind_at(self.kind).name))?.clone();
         let key: Key = (row.ctx.clone(), row.ns.clone(), row.name.clone());
@@ -2760,30 +2771,182 @@ impl Explorer {
                     .into_any_element(),
             );
         }
-        let n = replicas(&row.obj);
         let kind = self.kind;
-        let step = |id: &'static str, icon_name: &'static str, delta: i64, label: &'static str| {
-            let key = key.clone();
-            icon_button(id, icon_name, DIM, label)
-                .on_click(cx.listener(move |this, _, _, cx| this.act(Action::ScaleBy(delta), kind, key.clone(), cx)))
-        };
         Some(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(step("scale-down", "minus", -1, "Scale down"))
-                .child(
-                    div()
-                        .min_w(px(28.))
-                        .text_center()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .child(n.to_string()),
-                )
-                .child(step("scale-up", "plus", 1, "Scale up"))
+            button("scale", "arrow-up-down", format!("Scale · {}", replicas(&row.obj)), DIM)
+                .on_click(cx.listener(move |this, _, _, cx| this.open_scale_modal(kind, vec![key.clone()], cx)))
                 .into_any_element(),
         )
+    }
+
+    fn open_scale_modal(&mut self, kind: usize, keys: Vec<Key>, cx: &mut Context<Self>) {
+        let current = match &keys[..] {
+            [key] => self.cached_row(kind, key).map(|r| replicas(&r.obj)),
+            _ => None,
+        };
+        self.scale_modal = Some(ScaleModal {
+            kind,
+            keys,
+            current,
+            input: None,
+            focus: true,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// Creates the dialog's number field (needs the window) and focuses it once.
+    fn sync_scale_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.scale_modal.as_mut() else { return };
+        let input = match &m.input {
+            Some(input) => input.clone(),
+            None => {
+                let start = m.current.map_or(String::new(), |n| n.to_string());
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(start));
+                cx.subscribe(&input, |this: &mut Self, _, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.submit_scale_modal(cx);
+                    }
+                })
+                .detach();
+                m.input = Some(input.clone());
+                input
+            }
+        };
+        if m.focus {
+            m.focus = false;
+            input.update(cx, |s, cx| s.focus(window, cx));
+            window.dispatch_action(Box::new(SelectAll), cx);
+        }
+    }
+
+    fn submit_scale_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.scale_modal.as_mut() else { return };
+        let text = m.input.as_ref().map(|i| i.read(cx).value().trim().to_string()).unwrap_or_default();
+        let n = match text.parse::<i64>() {
+            Ok(n) if (0..=1000).contains(&n) => n,
+            _ => {
+                m.error = Some("Enter a number of replicas from 0 to 1000".into());
+                return cx.notify();
+            }
+        };
+        let Some(m) = self.scale_modal.take() else { return };
+        for key in m.keys {
+            self.act(Action::ScaleTo(n), m.kind, key, cx);
+        }
+        self.picked.clear();
+        cx.notify();
+    }
+
+    /// The Scale dialog: which object(s), a replica count with −/+, Scale.
+    fn scale_dialog(&self, m: &ScaleModal, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = kind_at(m.kind);
+        let (title, sub) = match &m.keys[..] {
+            [(ctx, ns, name)] => (
+                if ns.is_empty() { name.clone() } else { format!("{ns} / {name}") },
+                format!("{} · {}", ctx.name, kind.kind),
+            ),
+            keys => (
+                format!("{} {}", keys.len(), kind.name.to_lowercase()),
+                "Scale all to the same count".into(),
+            ),
+        };
+        let step = |id: &'static str, icon_name: &'static str, delta: i64| {
+            icon_button(id, icon_name, DIM, if delta > 0 { "One more" } else { "One fewer" }).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    let Some(input) = this.scale_modal.as_ref().and_then(|m| m.input.clone()) else {
+                        return;
+                    };
+                    let n = input.read(cx).value().trim().parse::<i64>().unwrap_or(0);
+                    input.update(cx, |s, cx| s.set_value((n + delta).max(0).to_string(), window, cx));
+                },
+            ))
+        };
+        div()
+            .id("scale-modal")
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.scale_modal = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .w(px(380.))
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(0x34374a))
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .px_6()
+                    .pt_5()
+                    .pb_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().text_color(rgb(DIM)).child(sub))
+                            .child(div().text_xl().font_weight(FontWeight::BOLD).truncate().child(title)),
+                    )
+                    .child(
+                        div()
+                            .id("scale-modal-close")
+                            .mt_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.scale_modal = None;
+                                cx.notify();
+                            }))
+                            .child(icon("x", DIM).size(px(18.))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .px_6()
+                    .pt_5()
+                    .pb_5()
+                    .child(div().text_sm().text_color(rgb(DIM)).child("Replicas"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(step("scale-minus", "minus", -1))
+                            .child(div().w(px(110.)).when_some(m.input.clone(), |d, input| d.child(Input::new(&input))))
+                            .child(step("scale-plus", "plus", 1))
+                            .when_some(m.current, |d, n| {
+                                d.child(div().text_xs().text_color(rgb(FAINT)).child(format!("now {n}")))
+                            }),
+                    )
+                    .when_some(m.error.clone(), |d, e| d.child(div().text_xs().text_color(rgb(RED)).child(e)))
+                    .child(
+                        div().flex().justify_end().child(
+                            div()
+                                .id("scale-submit")
+                                .px_4()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x4c6fdc))
+                                .text_color(rgb(0xffffff))
+                                .font_weight(FontWeight::MEDIUM)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x5b7ce6)))
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_scale_modal(cx)))
+                                .child("Scale"),
+                        ),
+                    ),
+            )
     }
 
     fn cached_row(&self, kind: usize, key: &Key) -> Option<Arc<Row>> {
@@ -4276,17 +4439,12 @@ impl Explorer {
         };
         // Scaling: work out the new count now; an autoscaler owns the count, so leave those alone.
         let scale_to = match action {
-            Action::ScaleBy(_) | Action::ScaleTo(_) => {
+            Action::ScaleTo(n) => {
                 if let Some(hpa) = self.autoscaler(kind_ix_, &key) {
                     self.status = format!("{} is scaled by HPA {}; change the HPA instead", key.2, hpa.name);
                     return cx.notify();
                 }
-                let current = self.cached_row(kind_ix_, &key).map_or(1, |r| replicas(&r.obj));
-                match action {
-                    Action::ScaleBy(d) => (current + d).max(0),
-                    Action::ScaleTo(n) => n,
-                    _ => unreachable!(),
-                }
+                n
             }
             _ => 0,
         };
@@ -4343,7 +4501,7 @@ impl Explorer {
                 ))
                 .await
                 .map(|_| format!("Suspended {what}")),
-                Action::ScaleBy(_) | Action::ScaleTo(_) => run(k8s::patch(
+                Action::ScaleTo(_) => run(k8s::patch(
                     ctx,
                     kind,
                     ns,
@@ -5758,6 +5916,7 @@ impl Explorer {
             }
             "escape" if self.picker_open => self.picker_open = false,
             "escape" if self.fwd_modal.is_some() => self.fwd_modal = None,
+            "escape" if self.scale_modal.is_some() => self.scale_modal = None,
             "escape" if self.ns_open => self.ns_open = false,
             "escape" if self.helm_sel.is_some() => self.helm_sel = None,
             "escape" if !self.picked.is_empty() && self.selected.is_none() => self.picked.clear(),
@@ -6978,7 +7137,7 @@ impl Explorer {
                                     .min_w_0()
                                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child({
                                         // Title row also holds back/copy/actions/close (26px + gap each).
-                                        let buttons = 3 + Action::quick(kind, false).len() + if scalable(kind.name) { 3 } else { 0 };
+                                        let buttons = 3 + Action::quick(kind, false).len() + if scalable(kind.name) { 2 } else { 0 };
                                         let room = self.detail_w - 32. - buttons as f32 * 34.;
                                         // Title is text_base (1rem) vs the table's text_sm, so scale the budget down.
                                         fit_text(window, cx, name, room * 0.875)
@@ -7143,6 +7302,7 @@ impl Render for Explorer {
         self.sync_editor(window, cx);
         self.sync_value_views(window, cx);
         self.sync_fwd_modal(window, cx);
+        self.sync_scale_modal(window, cx);
         self.sync_ns_search(window, cx);
         self.sync_logs(window, cx);
         self.sync_helm_text(window, cx);
@@ -7501,6 +7661,30 @@ impl Render for Explorer {
                             }),
                         )
                         .child(self.ns_picker(cx)),
+                )
+            })
+            .when(self.scale_modal.is_some(), |d| {
+                let dialog = self.scale_modal.as_ref().map(|m| self.scale_dialog(m, cx).into_any_element());
+                d.child(
+                    div()
+                        .id("scale-modal-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.45))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.scale_modal = None;
+                                cx.notify();
+                            }),
+                        )
+                        .children(dialog),
                 )
             })
             .when(self.fwd_modal.is_some(), |d| {
