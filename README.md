@@ -58,6 +58,10 @@ and it idles at around 1% CPU.
   scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work. Handy for
   production, since actions don't ask for confirmation.
 - **Secrets** stay masked until you click the eye icon.
+- **Settings** (⌘,): theme (system, light or dark), automatic updates, kubeconfig files, a display
+  name and colour per context, protected and muted contexts, which problems notify you (warnings too,
+  sound, ignored namespaces, Flux grace period), which kinds show in the sidebar, your terminal (Ghostty,
+  Terminal or iTerm), the debug image, and log defaults.
 - **Native feel.** Follows macOS light and dark mode, remembers window position, sorting, sidebar
   layout, and context and namespace selection.
 
@@ -124,6 +128,7 @@ context switcher at the top left (⌘K) to tick contexts or add more kubeconfig 
 | type anywhere | filter the current page (space-separated terms must all match) |
 | ⌘P | search everything |
 | ⌘K | contexts |
+| ⌘, | settings |
 | ↑ ↓ / Enter | select / open |
 | Esc, ⌘[ | back / clear filter / clear selection |
 | ⌘-click, ⇧-click, ⌘A | multi-select rows for bulk actions |

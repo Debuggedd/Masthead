@@ -454,6 +454,27 @@ pub fn app_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_default().join("Masthead")
 }
 
+/// Kubeconfig files added in the app (not the $KUBECONFIG / ~/.kube/config defaults).
+pub fn added_kubeconfig_files() -> Vec<PathBuf> {
+    std::fs::read_to_string(saved_list())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Forgets an added kubeconfig file (the file itself stays).
+pub fn remove_kubeconfig_file(file: &std::path::Path) -> Result<()> {
+    let keep: String = added_kubeconfig_files()
+        .into_iter()
+        .filter(|f| f != file)
+        .map(|f| format!("{}\n", f.display()))
+        .collect();
+    Ok(std::fs::write(saved_list(), keep)?)
+}
+
 pub fn save_kubeconfig_files(added: &[PathBuf]) -> Result<()> {
     let path = saved_list();
     std::fs::create_dir_all(path.parent().unwrap())?;

@@ -1,4 +1,5 @@
 mod k8s;
+mod settings;
 mod update;
 
 use gpui::{
@@ -15,6 +16,7 @@ use gpui_component::{
 };
 use k8s::{CACHE, Ctx, Kind, METRICS, Metrics, RT, Row, Usage, VERSION, kind as kind_at, kinds};
 use serde_json::Value;
+use settings::Prefs;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -24,7 +26,7 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
-actions!(masthead, [Quit, Search, CheckForUpdates]);
+actions!(masthead, [Quit, Search, CheckForUpdates, OpenSettings]);
 
 /// Live-cluster tests share the global cache, so they run one at a time.
 #[cfg(test)]
@@ -76,9 +78,9 @@ fn light_of(c: u32) -> u32 {
 /// Picks the palette from the window's appearance and themes gpui-component (editor, menus) to match.
 fn apply_theme(window: &mut Window, cx: &mut App) {
     // MASTHEAD_APPEARANCE=light|dark overrides macOS (screenshots).
-    let light = match std::env::var("MASTHEAD_APPEARANCE").as_deref() {
-        Ok("light") => true,
-        Ok("dark") => false,
+    let light = match (std::env::var("MASTHEAD_APPEARANCE").as_deref(), settings::THEME.load(Relaxed)) {
+        (Ok("light"), _) | (_, 1) => true,
+        (Ok("dark"), _) | (_, 2) => false,
         _ => matches!(
             window.appearance(),
             gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight
@@ -297,6 +299,10 @@ icons!(
     "badge-check",
     "link-2",
     "minus",
+    "command",
+    "settings",
+    "bell",
+    "bell-off",
     "bug",
     "arrow-up-down",
 );
@@ -532,7 +538,14 @@ fn row_menu(
     // Header: object name with its kind, namespace and context.
     let (name, sub) = (key.2.clone(), {
         let mut parts = vec![k.kind.to_string()];
-        parts.extend([key.1.clone(), key.0.name.clone()].into_iter().filter(|s| !s.is_empty()));
+        parts.extend(
+            [
+                key.1.clone(),
+                view.upgrade().map_or(key.0.name.clone(), |v| v.read(cx).ctx_label(&key.0)),
+            ]
+            .into_iter()
+            .filter(|s| !s.is_empty()),
+        );
         parts.join(" · ")
     });
     let mut menu = menu
@@ -612,7 +625,7 @@ fn row_menu(
         if k.name == "Pods" {
             menu = menu.item(entry(
                 "Debug container".into(),
-                DEBUG_IMAGE.into(),
+                debug_image(),
                 "bug",
                 GREEN,
                 false,
@@ -781,12 +794,12 @@ fn row_menu(
 /// A Flux Ready condition that's a real problem. Not-Ready blips are normal: dependents report
 /// DependencyNotReady while their dependency reconciles (every interval), and a reconcile can fail once
 /// and recover. So skip DependencyNotReady (a broken dependency is listed itself) and anything that
-/// hasn't been not-Ready for 5 minutes.
-fn flux_failing(cond: &Value, now: i64) -> bool {
+/// hasn't been not-Ready for `grace` seconds (Settings → Flux grace period, 5 minutes by default).
+fn flux_failing(cond: &Value, now: i64, grace: i64) -> bool {
     cond["type"] == "Ready"
         && cond["status"] == "False"
         && cond["reason"] != "DependencyNotReady"
-        && k8s::ts(cond, "/lastTransitionTime").is_some_and(|since| now - since >= 300)
+        && k8s::ts(cond, "/lastTransitionTime").is_some_and(|since| now - since >= grace)
 }
 
 fn suspended(obj: &Value) -> bool {
@@ -1008,7 +1021,6 @@ struct Explorer {
     log_timestamps: bool,
     log_search: Option<Entity<InputState>>,
     log_scroll: UniformListScrollHandle,
-    log_wrap: bool,
     /// Show only lines at least this severe (`Level::None`: everything).
     log_min_level: k8s::Level,
     /// Only the last this many seconds of logs (None: the last ~2000 lines).
@@ -1025,6 +1037,14 @@ struct Explorer {
     scale_modal: Option<ScaleModal>,
     /// Actions sent but not answered yet, so a double click doesn't send them twice.
     in_flight: std::collections::HashSet<(Action, usize, Key)>,
+    /// Everything on the Settings page (settings.json).
+    prefs: Prefs,
+    settings_mode: bool,
+    /// Text fields on the Settings page, by key ("ignore", "alias:<context>", …).
+    settings_inputs: HashMap<String, Entity<InputState>>,
+    settings_scroll: gpui::ScrollHandle,
+    /// "Reset settings" was clicked once; the next click resets.
+    reset_armed: bool,
     /// ⌘P search: the query field (Some = open) and the highlighted result.
     palette: Option<Entity<InputState>>,
     palette_sel: usize,
@@ -1067,10 +1087,6 @@ struct Explorer {
     ns_open: bool,
     /// Search field of the namespace picker (created on open; needs the window).
     ns_search: Option<Entity<InputState>>,
-    /// Open the forwarded URL in the browser once a forward starts (remembered in settings.json).
-    open_browser: bool,
-    /// Post a macOS notification for new errors (remembered in settings.json).
-    notify: bool,
     /// Errors already seen (notified or baseline), by `problem_id`.
     notified: std::collections::HashSet<String>,
     /// When each context was selected: its first minute of problems is baseline, not "new".
@@ -1128,6 +1144,7 @@ impl Explorer {
                     }
                     if OPEN_PROBLEMS.swap(false, Relaxed) {
                         (this.problems_mode, this.selected, this.from_problems, this.home_mode) = (true, None, false, false);
+                        this.settings_mode = false;
                         (this.helm_mode, this.helm_sel) = (false, None);
                         this.history.clear();
                         cx.notify();
@@ -1174,23 +1191,24 @@ impl Explorer {
             logs: None,
             log_follow: true,
             log_min_level: k8s::Level::None,
-            log_since: None,
+            log_since: load_json::<Prefs>("settings.json").log_since,
             log_previous: false,
-            log_timestamps: false,
+            log_timestamps: load_json::<Prefs>("settings.json").log_timestamps,
             log_search: None,
             log_scroll: UniformListScrollHandle::new(),
             log_view: vec![],
             log_widest: 0,
-            log_wrap: load_json::<HashMap<String, bool>>("settings.json")
-                .get("log_wrap")
-                .copied()
-                .unwrap_or(false),
             list_scroll: UniformListScrollHandle::new(),
             picker_open: false,
             forwards: vec![],
             fwd_modal: None,
             scale_modal: None,
             in_flight: Default::default(),
+            prefs: settings::shared(),
+            settings_mode: false,
+            settings_inputs: HashMap::new(),
+            settings_scroll: gpui::ScrollHandle::new(),
+            reset_armed: false,
             palette: None,
             palette_sel: 0,
             palette_scroll: gpui::ScrollHandle::new(),
@@ -1218,14 +1236,6 @@ impl Explorer {
             protected: load_json("protected.json"),
             ns_open: false,
             ns_search: None,
-            open_browser: load_json::<HashMap<String, bool>>("settings.json")
-                .get("open_browser")
-                .copied()
-                .unwrap_or(false),
-            notify: load_json::<HashMap<String, bool>>("settings.json")
-                .get("notify")
-                .copied()
-                .unwrap_or(true),
             notified: Default::default(),
             ctx_since: HashMap::new(),
             pending_open: std::env::var("MASTHEAD_OPEN").ok(),
@@ -1257,6 +1267,9 @@ impl Explorer {
 
     /// Looks for a newer release. Manual checks (menu, footer version) report every outcome in the status bar.
     fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if !manual && !self.prefs.auto_update {
+            return;
+        }
         if DEV && std::env::var("MASTHEAD_RELEASES_URL").is_err() {
             if manual {
                 self.status = "This is a dev build, so it doesn't update itself. Releases do.".into();
@@ -1532,8 +1545,13 @@ impl Explorer {
         changed
     }
 
+    /// The context's color from Settings, else one by its position in the list.
     fn ctx_color(&self, ctx: &Ctx) -> u32 {
-        CTX_COLORS[self.ctxs.iter().position(|c| c == ctx).unwrap_or(0) % CTX_COLORS.len()]
+        self.prefs
+            .contexts
+            .get(&ctx.name)
+            .and_then(|p| p.color)
+            .unwrap_or_else(|| CTX_COLORS[self.ctxs.iter().position(|c| c == ctx).unwrap_or(0) % CTX_COLORS.len()])
     }
 
     /// Connection state of an active context, derived from its watchers.
@@ -1595,6 +1613,7 @@ impl Explorer {
     }
 
     fn set_kind(&mut self, kind: usize, cx: &mut Context<Self>) {
+        self.settings_mode = false;
         self.problems_mode = false;
         self.picked.clear();
         (self.helm_mode, self.helm_sel, self.home_mode) = (false, None, false);
@@ -1609,6 +1628,28 @@ impl Explorer {
 
     fn apply_pending_open(&mut self, cx: &mut Context<Self>) {
         let Some(spec) = self.pending_open.take() else { return };
+        if let Some(rest) = spec.strip_prefix("Settings") {
+            self.settings_mode = true;
+            if rest == "#end" || rest == "#mid" {
+                // Dev hook for screenshots: scroll down once laid out.
+                let mid = rest == "#mid";
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(800)).await;
+                    this.update(cx, |this, cx| {
+                        if mid {
+                            let max = this.settings_scroll.max_offset().height;
+                            this.settings_scroll.set_offset(point(px(0.), -max * 0.55));
+                        } else {
+                            this.settings_scroll.scroll_to_bottom();
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            return cx.notify();
+        }
         if let Some(q) = spec.strip_prefix("Search:") {
             self.palette_query = Some(q.to_string());
             return cx.notify();
@@ -1694,7 +1735,7 @@ impl Explorer {
                 "forward!" => {
                     // Dev hook for screenshots: start forwarding the first port (never opens the browser).
                     if let Some(t) = self.forward_targets(&r.clone()).into_iter().next() {
-                        self.open_browser = false;
+                        self.prefs.open_browser = false;
                         let row = r.clone();
                         self.start_forward(&row, t, None, cx);
                     }
@@ -1798,6 +1839,7 @@ impl Explorer {
     }
 
     fn open(&mut self, kind: usize, key: Key, cx: &mut Context<Self>) {
+        self.settings_mode = false;
         self.problems_mode = false;
         (self.helm_mode, self.helm_sel, self.home_mode) = (false, None, false);
         if self.kind != kind {
@@ -2157,7 +2199,10 @@ impl Explorer {
                         push(2, ix, r, "Suspended".into(), "Reconciliation paused".into(), r.created);
                         continue;
                     }
-                    if let Some(c) = k8s::arr(&r.obj, "/status/conditions").iter().find(|c| flux_failing(c, now)) {
+                    if let Some(c) = k8s::arr(&r.obj, "/status/conditions")
+                        .iter()
+                        .find(|c| flux_failing(c, now, self.prefs.flux_grace_min * 60))
+                    {
                         push(
                             0,
                             ix,
@@ -2377,7 +2422,7 @@ impl Explorer {
                     .items_center()
                     .gap_3()
                     .child(self.ctx_avatar(ctx))
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(ctx.name.clone()))
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(self.ctx_label(ctx)))
                     .when(!version.is_empty(), |d| {
                         d.child(div().text_sm().text_color(rgb(FAINT)).child(format!("Kubernetes {version}")))
                     })
@@ -2673,15 +2718,15 @@ impl Explorer {
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(TEXT)))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.notify = !this.notify;
+                    this.prefs.notify = !this.prefs.notify;
                     #[cfg(target_os = "macos")]
-                    if this.notify {
+                    if this.prefs.notify {
                         setup_notifications();
                     }
                     this.save_settings();
                     cx.notify();
                 }))
-                .child(checkbox(self.notify))
+                .child(checkbox(self.prefs.notify))
                 .child("Notify me about new errors (macOS notification, also while the app is in the background)"),
         );
         if visible.is_empty() {
@@ -2745,7 +2790,11 @@ impl Explorer {
                                             } else {
                                                 format!(" · {}", p.key.1)
                                             },
-                                            if many { format!(" · {}", p.key.0.name) } else { String::new() }
+                                            if many {
+                                                format!(" · {}", self.ctx_label(&p.key.0))
+                                            } else {
+                                                String::new()
+                                            }
                                         )))
                                         .child(div().flex_1())
                                         .when(p.since > 0, |d| {
@@ -2881,7 +2930,7 @@ impl Explorer {
         let (title, sub) = match &m.keys[..] {
             [(ctx, ns, name)] => (
                 if ns.is_empty() { name.clone() } else { format!("{ns} / {name}") },
-                format!("{} · {}", ctx.name, kind.kind),
+                format!("{} · {}", self.ctx_label(ctx), kind.kind),
             ),
             keys => (
                 format!("{} {}", keys.len(), kind.name.to_lowercase()),
@@ -3294,7 +3343,11 @@ impl Explorer {
                                     "{}{}{}",
                                     k.kind,
                                     if ns.is_empty() { String::new() } else { format!(" · {ns}") },
-                                    if many { format!(" · {}", ctx.name) } else { String::new() }
+                                    if many {
+                                        format!(" · {}", self.ctx_label(ctx))
+                                    } else {
+                                        String::new()
+                                    }
                                 ),
                             ),
                             None => (k.name.to_string(), "Page".to_string()),
@@ -3331,13 +3384,8 @@ impl Explorer {
     }
 
     fn save_settings(&mut self) {
-        let settings: HashMap<String, bool> = [
-            ("open_browser".into(), self.open_browser),
-            ("notify".into(), self.notify),
-            ("log_wrap".into(), self.log_wrap),
-        ]
-        .into();
-        if let Err(e) = save_json("settings.json", &settings) {
+        *settings::SHARED.write().unwrap() = self.prefs.clone();
+        if let Err(e) = save_json("settings.json", &self.prefs) {
             self.status = format!("Could not save settings: {e}");
         }
     }
@@ -3345,12 +3393,14 @@ impl Explorer {
     /// Posts a notification for errors that weren't there before. A context's first minute is baseline,
     /// so selecting a cluster with existing errors doesn't spam you.
     fn notify_new_problems(&mut self) {
-        let errors: Vec<&Problem> = self.problems.iter().filter(|p| p.severity == 0).collect();
+        // Errors (and warnings if asked for), minus muted contexts and ignored namespaces.
+        let wanted = |p: &Problem| (p.severity == 0 || (self.prefs.notify_warnings && p.severity == 1)) && !self.muted(&p.key.0, &p.key.1);
+        let errors: Vec<&Problem> = self.problems.iter().filter(|p| wanted(p)).collect();
         let fresh = new_problems(&self.notified, &errors);
         self.notified = errors.iter().map(|p| problem_id(p)).collect();
         let settled = |p: &Problem| self.ctx_since.get(&p.key.0).is_some_and(|t| t.elapsed() > Duration::from_secs(60));
         let fresh: Vec<&Problem> = fresh.into_iter().filter(|p| settled(p)).collect();
-        if !self.notify || fresh.is_empty() {
+        if !self.prefs.notify || fresh.is_empty() {
             return;
         }
         let (title, subtitle, body) = match fresh.as_slice() {
@@ -3362,13 +3412,13 @@ impl Explorer {
                     format!("{}/", p.key.1)
                 };
                 (
-                    format!("{}: {}", p.key.0.name, p.reason),
+                    format!("{}: {}", self.ctx_label(&p.key.0), p.reason),
                     format!("{k} {ns}{}", p.key.2),
                     brief(&p.message),
                 )
             }
             many => {
-                let ctxs: std::collections::BTreeSet<&str> = many.iter().map(|p| p.key.0.name.as_str()).collect();
+                let ctxs: std::collections::BTreeSet<String> = many.iter().map(|p| self.ctx_label(&p.key.0)).collect();
                 let names: Vec<String> = many.iter().take(3).map(|p| format!("{} ({})", p.key.2, p.reason)).collect();
                 (
                     format!("{} new errors", many.len()),
@@ -3456,7 +3506,16 @@ impl Explorer {
             })
             .filter(|(r, d)| {
                 let chart = d.as_ref().map(|d| k8s::s(d, "/chart/metadata/name")).unwrap_or_default();
-                let line = format!("{} {} {} {} {}", r.name, r.ns, r.status, chart, r.ctx.name).to_lowercase();
+                let line = format!(
+                    "{} {} {} {} {} {}",
+                    r.name,
+                    r.ns,
+                    r.status,
+                    chart,
+                    r.ctx.name,
+                    self.ctx_label(&r.ctx)
+                )
+                .to_lowercase();
                 terms.iter().all(|t| line.contains(t))
             })
             .collect();
@@ -3535,7 +3594,7 @@ impl Explorer {
                                         .gap_1p5()
                                         .text_color(rgb(DIM))
                                         .child(div().flex_none().size(px(8.)).rounded_sm().bg(rgb(self.ctx_color(&r.ctx))))
-                                        .child(div().truncate().child(r.ctx.name.clone())),
+                                        .child(div().truncate().child(self.ctx_label(&r.ctx))),
                                 )
                             })
                             .child(col(150.).text_color(rgb(DIM)).child(r.ns.clone()))
@@ -3679,7 +3738,7 @@ impl Explorer {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(FAINT))
-                                    .child(format!("Helm release · {} · {ns}", ctx.name)),
+                                    .child(format!("Helm release · {} · {ns}", self.ctx_label(&ctx))),
                             ),
                     ),
             )
@@ -4126,7 +4185,7 @@ impl Explorer {
         }
         // Wrapping splits lines by character count, which works because the log font is monospace.
         // ponytail: wide chars (CJK, emoji) count as one column, so such lines wrap a bit late.
-        let cols = if self.log_wrap {
+        let cols = if self.prefs.log_wrap {
             let width = self.log_scroll.0.borrow().base_handle.bounds().size.width;
             if width <= px(0.) {
                 cx.on_next_frame(window, |_, _, cx| cx.notify()); // not laid out yet
@@ -4336,11 +4395,13 @@ impl Explorer {
                             cx.notify();
                         })),
                     )
-                    .child(toggle("log-wrap", "Wrap", self.log_wrap).on_click(cx.listener(|this, _, _, cx| {
-                        this.log_wrap = !this.log_wrap;
-                        this.save_settings();
-                        cx.notify();
-                    })))
+                    .child(
+                        toggle("log-wrap", "Wrap", self.prefs.log_wrap).on_click(cx.listener(|this, _, _, cx| {
+                            this.prefs.log_wrap = !this.prefs.log_wrap;
+                            this.save_settings();
+                            cx.notify();
+                        })),
+                    )
                     .child(
                         toggle("log-ts", "Timestamps", self.log_timestamps).on_click(cx.listener(|this, _, _, cx| {
                             this.log_timestamps = !this.log_timestamps;
@@ -4441,7 +4502,7 @@ impl Explorer {
                     }),
                 )
                 .track_scroll(self.log_scroll.clone())
-                .when(!self.log_wrap, |l| {
+                .when(!self.prefs.log_wrap, |l| {
                     l.with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                         .with_width_from_item(Some(self.log_widest))
                 })
@@ -4624,7 +4685,7 @@ impl Explorer {
     fn cells(&self, r: &Row) -> Vec<String> {
         let mut c = vec![];
         if self.active.len() > 1 {
-            c.push(r.ctx.name.clone());
+            c.push(self.ctx_label(&r.ctx));
         }
         if kind_at(self.kind).namespaced {
             c.push(r.ns.clone());
@@ -4886,7 +4947,7 @@ impl Explorer {
                 match res {
                     Ok(fwd) => {
                         this.status = format!("Forwarding localhost:{} → {what}:{}", fwd.local, t.want);
-                        if this.open_browser {
+                        if this.prefs.open_browser {
                             let scheme = if matches!(t.remote, 443 | 8443) { "https" } else { "http" };
                             cx.open_url(&format!("{scheme}://localhost:{}", fwd.local));
                         }
@@ -5066,7 +5127,7 @@ impl Explorer {
     }
 
     fn open_browser_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = self.open_browser;
+        let on = self.prefs.open_browser;
         let checkbox = div().flex_none().size(px(16.)).rounded_sm().flex().items_center().justify_center();
         div()
             .id(id)
@@ -5076,7 +5137,7 @@ impl Explorer {
             .text_color(rgb(TEXT))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
-                this.open_browser = !this.open_browser;
+                this.prefs.open_browser = !this.prefs.open_browser;
                 this.save_settings();
                 cx.notify();
             }))
@@ -5130,12 +5191,11 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(DIM))
-                                    .child(format!("{} · {}", r.ctx.name, kind_at(self.kind).kind)),
-                            )
+                            .child(div().text_sm().text_color(rgb(DIM)).child(format!(
+                                "{} · {}",
+                                self.ctx_label(&r.ctx),
+                                kind_at(self.kind).kind
+                            )))
                             .child(
                                 div()
                                     .text_xl()
@@ -5334,7 +5394,7 @@ impl Explorer {
                     "{}:{} · {} · {} · pod {} · {}",
                     f.what,
                     f.remote,
-                    f.ctx.name,
+                    self.ctx_label(&f.ctx),
                     f.ns,
                     f.pod,
                     error.clone().unwrap_or_else(|| match conns {
@@ -5965,6 +6025,7 @@ impl Explorer {
             "escape" if self.picker_open => self.picker_open = false,
             "escape" if self.fwd_modal.is_some() => self.fwd_modal = None,
             "escape" if self.scale_modal.is_some() => self.scale_modal = None,
+            "escape" if self.settings_mode => self.settings_mode = false,
             "escape" if self.ns_open => self.ns_open = false,
             "escape" if self.helm_sel.is_some() => self.helm_sel = None,
             "escape" if !self.picked.is_empty() && self.selected.is_none() => self.picked.clear(),
@@ -6025,7 +6086,7 @@ impl Explorer {
     }
 
     fn ctx_avatar(&self, ctx: &Ctx) -> Div {
-        let initial = ctx.name.chars().next().unwrap_or('?').to_ascii_uppercase().to_string();
+        let initial = self.ctx_label(ctx).chars().next().unwrap_or('?').to_ascii_uppercase().to_string();
         div()
             .flex_none()
             .size(px(20.))
@@ -6048,7 +6109,7 @@ impl Explorer {
             [] => ("Choose a context".to_string(), "No context selected".to_string(), FAINT),
             [c] => {
                 let (state, color) = Self::ctx_state(c);
-                (c.name.clone(), state.to_string(), color)
+                (self.ctx_label(c), state.to_string(), color)
             }
             many => {
                 let live = many.iter().filter(|c| Self::ctx_state(c).0 == "Live").count();
@@ -6135,7 +6196,7 @@ impl Explorer {
                         .min_w_0()
                         .truncate()
                         .text_color(rgb(if on { TEXT } else { DIM }))
-                        .child(c.name.clone()),
+                        .child(self.ctx_label(c)),
                 )
                 .when(many_files, |d| {
                     d.child(div().flex_none().text_xs().text_color(rgb(FAINT)).child(file))
@@ -6216,7 +6277,7 @@ impl Explorer {
     }
 
     fn kind_item(&self, i: usize, k: &'static Kind, indent: bool, cx: &mut Context<Self>) -> AnyElement {
-        let on = i == self.kind && !self.problems_mode && !self.helm_mode && !self.home_mode;
+        let on = i == self.kind && !self.problems_mode && !self.helm_mode && !self.home_mode && !self.settings_mode;
         div()
             .id(("kind", i))
             .flex()
@@ -6263,15 +6324,21 @@ impl Explorer {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .text_color(rgb(if self.home_mode { TEXT } else { DIM }))
-                .when(self.home_mode, |d| d.bg(rgb(SELECT)))
-                .when(!self.home_mode, |d| d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                .text_color(rgb(if self.home_mode && !self.settings_mode { TEXT } else { DIM }))
+                .when(self.home_mode && !self.settings_mode, |d| d.bg(rgb(SELECT)))
+                .when(!self.home_mode || self.settings_mode, |d| {
+                    d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
                     (this.home_mode, this.problems_mode, this.helm_mode, this.helm_sel, this.selected) = (true, false, false, None, None);
+                    this.settings_mode = false;
                     this.history.clear();
                     cx.notify();
                 }))
-                .child(icon("layout-dashboard", if self.home_mode { ACCENT } else { FAINT }))
+                .child(icon(
+                    "layout-dashboard",
+                    if self.home_mode && !self.settings_mode { ACCENT } else { FAINT },
+                ))
                 .child("Overview")
                 .into_any_element(),
         );
@@ -6285,11 +6352,14 @@ impl Explorer {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .text_color(rgb(if self.problems_mode { TEXT } else { DIM }))
-                .when(self.problems_mode, |d| d.bg(rgb(SELECT)))
-                .when(!self.problems_mode, |d| d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                .text_color(rgb(if self.problems_mode && !self.settings_mode { TEXT } else { DIM }))
+                .when(self.problems_mode && !self.settings_mode, |d| d.bg(rgb(SELECT)))
+                .when(!self.problems_mode || self.settings_mode, |d| {
+                    d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
                     (this.problems_mode, this.selected, this.from_problems, this.home_mode) = (true, None, false, false);
+                    this.settings_mode = false;
                     (this.helm_mode, this.helm_sel) = (false, None);
                     this.history.clear();
                     cx.notify();
@@ -6324,11 +6394,20 @@ impl Explorer {
                 })
                 .into_any_element(),
         );
+        // Kinds hidden in Settings are skipped, and so is a group header once all its kinds are hidden.
+        let mut header = "";
         for (i, k) in all.iter().enumerate().take(k8s::BUILTIN_COUNT) {
-            if let Some((label, icon, _)) = GROUPS.iter().find(|(_, _, start)| *start == i) {
-                kind_items.push(self.section_header(icon, label, cx));
+            if self.prefs.hidden_kinds.contains(k.name) {
+                continue;
             }
-            if !self.collapsed.contains(section_of(i)) {
+            let group = section_of(i);
+            if group != header {
+                header = group;
+                if let Some((label, icon, _)) = GROUPS.iter().find(|(label, ..)| *label == group) {
+                    kind_items.push(self.section_header(icon, label, cx));
+                }
+            }
+            if !self.collapsed.contains(group) {
                 kind_items.push(self.kind_item(i, k, false, cx));
             }
         }
@@ -6338,7 +6417,7 @@ impl Explorer {
         custom.dedup();
         kind_items.push(self.section_header("ship", "HELM", cx));
         if !self.collapsed.contains("HELM") {
-            let on = self.helm_mode;
+            let on = self.helm_mode && !self.settings_mode;
             kind_items.push(
                 div()
                     .id("helm-page")
@@ -6355,6 +6434,7 @@ impl Explorer {
                     .on_click(cx.listener(|this, _, _, cx| {
                         (this.helm_mode, this.helm_sel, this.problems_mode, this.selected, this.home_mode) =
                             (true, None, false, None, false);
+                        this.settings_mode = false;
                         this.history.clear();
                         cx.notify();
                     }))
@@ -7192,7 +7272,7 @@ impl Explorer {
                                     }))
                                     .child(div().text_xs().text_color(rgb(FAINT)).truncate().child(format!(
                                         "{singular} · {} · {}",
-                                        ctx.name,
+                                        self.ctx_label(&ctx),
                                         if ns.is_empty() { "cluster-scoped" } else { &ns }
                                     ))),
                             )
@@ -7351,6 +7431,7 @@ impl Render for Explorer {
         self.sync_value_views(window, cx);
         self.sync_fwd_modal(window, cx);
         self.sync_scale_modal(window, cx);
+        self.sync_settings(window, cx);
         self.sync_ns_search(window, cx);
         self.sync_logs(window, cx);
         self.sync_helm_text(window, cx);
@@ -7470,12 +7551,13 @@ impl Render for Explorer {
                 ),
                 None => d
                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(match () {
+                        _ if self.settings_mode => "Settings",
                         _ if self.home_mode => "Overview",
                         _ if self.problems_mode => "Problems",
                         _ if self.helm_mode => "Helm releases",
                         _ => kind.name,
                     }))
-                    .child(search),
+                    .when(!self.settings_mode, |d| d.child(search)),
             })
             .child(div().flex_1())
             .child({
@@ -7517,7 +7599,7 @@ impl Render for Explorer {
                 .border_color(rgb(0x4a2433))
                 .text_xs()
                 .text_color(rgb(RED))
-                .child(format!("{}: {e}", c.name))
+                .child(format!("{}: {e}", self.ctx_label(c)))
         });
         let footer = div()
             .flex()
@@ -7550,6 +7632,10 @@ impl Render for Explorer {
                     .flex_shrink()
                     .truncate()
                     .child("⌘P search   ↑↓ select   ⌘[ back   esc clear   ⌘K contexts   ⌘R reconnect"),
+            )
+            .child(
+                icon_button("open-settings", "settings", FAINT, "Settings (⌘,)")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             )
             .child(match &self.new_release {
                 Some(release) => button(
@@ -7615,9 +7701,10 @@ impl Render for Explorer {
                             .flex_1()
                             .min_h_0()
                             // A selected object gets the whole page; back returns to the list.
-                            .when(self.home_mode, |d| d.child(self.home_view(cx)))
-                            .when(self.problems_mode, |d| d.child(self.problems_view(cx)))
-                            .when(self.helm_mode, |d| {
+                            .when(self.settings_mode, |d| d.child(self.settings_view(cx)))
+                            .when(!self.settings_mode && self.home_mode, |d| d.child(self.home_view(cx)))
+                            .when(!self.settings_mode && self.problems_mode, |d| d.child(self.problems_view(cx)))
+                            .when(!self.settings_mode && self.helm_mode, |d| {
                                 d.child(if self.helm_sel.is_some() {
                                     self.helm_detail(window, cx)
                                 } else {
@@ -7625,7 +7712,7 @@ impl Render for Explorer {
                                 })
                             })
                             .when(
-                                self.selected.is_none() && !self.problems_mode && !self.helm_mode && !self.home_mode,
+                                !self.settings_mode && self.selected.is_none() && !self.problems_mode && !self.helm_mode && !self.home_mode,
                                 |d| {
                                     d.child(
                                         div()
@@ -7637,10 +7724,15 @@ impl Render for Explorer {
                                     )
                                 },
                             )
-                            .when(self.selected.is_some(), |d| d.child(self.detail(window, cx))),
+                            .when(!self.settings_mode && self.selected.is_some(), |d| d.child(self.detail(window, cx))),
                     )
                     .when(
-                        !self.picked.is_empty() && self.selected.is_none() && !self.problems_mode && !self.helm_mode && !self.home_mode,
+                        !self.settings_mode
+                            && !self.picked.is_empty()
+                            && self.selected.is_none()
+                            && !self.problems_mode
+                            && !self.helm_mode
+                            && !self.home_mode,
                         |d| d.child(self.bulk_bar(cx)),
                     )
                     .child(footer),
@@ -8093,10 +8185,15 @@ fn notify_macos(title: &str, subtitle: &str, body: &str) {
     // notification belongs to Script Editor (clicking it opens that).
     let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        "display notification \"{}\" with title \"{}\" subtitle \"{}\" sound name \"Basso\"",
+        "display notification \"{}\" with title \"{}\" subtitle \"{}\"{}",
         q(body),
         q(title),
-        q(subtitle)
+        q(subtitle),
+        if settings::shared().notify_sound {
+            " sound name \"Basso\""
+        } else {
+            ""
+        }
     );
     std::thread::spawn(move || {
         std::process::Command::new("osascript").args(["-e", &script]).output().ok();
@@ -8508,9 +8605,10 @@ fn restore_window(cx: &App) -> Option<(WindowBounds, Option<gpui::DisplayId>)> {
     Some((bounds, Some(display.id())))
 }
 
-/// Image for debug containers and node shells (busybox: small, has sh and nsenter).
-// ponytail: fixed public image; make it a setting if a cluster only pulls from a private registry.
-const DEBUG_IMAGE: &str = "busybox:1.36";
+/// Image for debug containers and node shells (Settings → Debug image; busybox: small, has sh and nsenter).
+fn debug_image() -> String {
+    settings::shared().debug_image
+}
 const PREFER_BASH: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
 /// Opens `kubectl exec -it` into a container in a new Ghostty tab. Returns a status line.
@@ -8525,7 +8623,7 @@ fn open_shell(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
 /// `kubectl debug`: an ephemeral busybox container in the pod, sharing the target container's processes
 /// (handy for distroless images without a shell). Ephemeral containers stay listed until the pod restarts.
 fn open_debug(ctx: &Ctx, ns: &str, pod: &str, container: &str, profile: &str) -> String {
-    let image = format!("--image={DEBUG_IMAGE}");
+    let image = format!("--image={}", debug_image());
     let target = format!("--target={container}");
     let profile = format!("--profile={profile}");
     let args = ["debug", "-it", "-n", ns, pod, &image, &target, &profile, "--", "sh"];
@@ -8547,14 +8645,14 @@ fn open_node_shell(ctx: &Ctx, node: &str) -> String {
         "nodeName": node, "hostPID": true, "hostNetwork": true, "hostIPC": true,
         "tolerations": [{"operator": "Exists"}],
         "containers": [{
-            "name": "shell", "image": DEBUG_IMAGE, "stdin": true, "tty": true,
+            "name": "shell", "image": debug_image(), "stdin": true, "tty": true,
             "securityContext": {"privileged": true},
             "command": ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", PREFER_BASH],
         }],
     }})
     .to_string();
     let overrides = format!("--overrides={overrides}");
-    let image = format!("--image={DEBUG_IMAGE}");
+    let image = format!("--image={}", debug_image());
     let args = [
         "run",
         &name,
@@ -8598,8 +8696,24 @@ fn open_kubectl(ctx: &Ctx, title: &str, kubectl_args: &[&str]) -> Result<(), Str
     // Ghostty: a new tab in the running instance (or a window if it has none) via its AppleScript API.
     // Not `open -na Ghostty --args -e`: that starts a second instance, which restores your saved
     // windows and puts the --title on all of them.
-    let script = if std::path::Path::new("/Applications/Ghostty.app").exists() {
-        format!(
+    let ghostty = std::path::Path::new("/Applications/Ghostty.app").exists();
+    let script = match settings::shared().terminal.as_str() {
+        "iterm" => format!(
+            "tell application \"iTerm\"\n\
+             activate\n\
+             if (count of windows) = 0 then\n\
+             create window with default profile command {0}\n\
+             else\n\
+             tell current window to create tab with default profile command {0}\n\
+             end if\n\
+             end tell",
+            as_applescript(&line)
+        ),
+        "terminal" => format!(
+            "tell application \"Terminal\"\n activate\n do script {}\nend tell",
+            as_applescript(&line)
+        ),
+        _ if ghostty || settings::shared().terminal == "ghostty" => format!(
             "tell application \"Ghostty\"\n\
              activate\n\
              set cfg to new surface configuration\n\
@@ -8612,12 +8726,11 @@ fn open_kubectl(ctx: &Ctx, title: &str, kubectl_args: &[&str]) -> Result<(), Str
              end if\n\
              end tell",
             as_applescript(&line)
-        )
-    } else {
-        format!(
+        ),
+        _ => format!(
             "tell application \"Terminal\"\n activate\n do script {}\nend tell",
             as_applescript(&line)
-        )
+        ),
     };
     std::process::Command::new("osascript")
         .args(["-e", &script])
@@ -8979,8 +9092,9 @@ fn kubectl_commands(k: &Kind, key: &Key, shell: Option<&(String, String)>, port:
             out.push((
                 "Debug container",
                 format!(
-                    "{base} debug -it {} --image={DEBUG_IMAGE} --target={} --profile=baseline -- sh",
+                    "{base} debug -it {} --image={} --target={} --profile=baseline -- sh",
                     q(pod),
+                    q(&debug_image()),
                     q(container)
                 ),
             ));
@@ -8989,7 +9103,7 @@ fn kubectl_commands(k: &Kind, key: &Key, shell: Option<&(String, String)>, port:
     if k.name == "Nodes" {
         out.push((
             "Debug node",
-            format!("{base} debug node/{} -it --image={DEBUG_IMAGE} --profile=sysadmin", q(name)),
+            format!("{base} debug node/{} -it --image={} --profile=sysadmin", q(name), q(&debug_image())),
         ));
     }
     if let Some(port) = port {
@@ -9188,8 +9302,10 @@ fn native_notify(title: &str, subtitle: &str, body: &str) -> bool {
         let () = msg_send![content, setTitle: text(title)];
         let () = msg_send![content, setSubtitle: text(subtitle)];
         let () = msg_send![content, setBody: text(body)];
-        let sound: *mut Object = msg_send![class!(UNNotificationSound), defaultSound];
-        let () = msg_send![content, setSound: sound];
+        if settings::shared().notify_sound {
+            let sound: *mut Object = msg_send![class!(UNNotificationSound), defaultSound];
+            let () = msg_send![content, setSound: sound];
+        }
         let id = text(&format!(
             "masthead-{}",
             std::time::SystemTime::now()
@@ -9226,6 +9342,7 @@ fn main() {
     use_login_shell_path();
     #[cfg(target_os = "macos")]
     keep_awake();
+    settings::THEME.store(settings::theme_code(&settings::shared().theme), Relaxed);
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         // Inside an .app the Dock already shows the bundle's icon (orange for dev builds); `cargo run` has none.
         #[cfg(target_os = "macos")]
@@ -9234,11 +9351,7 @@ fn main() {
         }
         gpui_component::init(cx);
         #[cfg(target_os = "macos")]
-        if load_json::<HashMap<String, bool>>("settings.json")
-            .get("notify")
-            .copied()
-            .unwrap_or(true)
-        {
+        if load_json::<Prefs>("settings.json").notify {
             setup_notifications();
         }
         LanguageRegistry::singleton().register(
@@ -9256,12 +9369,17 @@ fn main() {
         cx.set_menus(vec![gpui::Menu {
             name: APP_NAME.into(),
             items: vec![
+                gpui::MenuItem::action("Settings…", OpenSettings),
                 gpui::MenuItem::action("Check for Updates…", CheckForUpdates),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action(if DEV { "Quit Masthead Dev" } else { "Quit Masthead" }, Quit),
             ],
         }]);
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-p", Search, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-p", Search, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
+        ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -9331,9 +9449,16 @@ fn main() {
                     });
                 });
                 let weak = view.downgrade();
-                cx.on_action(move |_: &CheckForUpdates, cx| {
+                cx.on_action({
                     let weak = weak.clone();
-                    cx.defer(move |cx| _ = weak.update(cx, |this, cx| this.check_updates(true, cx)));
+                    move |_: &CheckForUpdates, cx| {
+                        let weak = weak.clone();
+                        cx.defer(move |cx| _ = weak.update(cx, |this, cx| this.check_updates(true, cx)));
+                    }
+                });
+                cx.on_action(move |_: &OpenSettings, cx| {
+                    let weak = weak.clone();
+                    cx.defer(move |cx| _ = weak.update(cx, |this, cx| this.open_settings(cx)));
                 });
                 if forced.is_none() {
                     view.update(cx, |_, cx| {
@@ -9631,9 +9756,9 @@ fn kubectl_command_shapes() {
         |reason: &str, since: &str| serde_json::json!({"type": "Ready", "status": "False", "reason": reason, "lastTransitionTime": since});
     let t = |s: &str| s.parse::<k8s_openapi::jiff::Timestamp>().unwrap().as_second();
     let now = t("2026-10-11T12:10:00Z");
-    assert!(!flux_failing(&cond("DependencyNotReady", "2026-10-11T11:00:00Z"), now));
-    assert!(!flux_failing(&cond("BuildFailed", "2026-10-11T12:08:00Z"), now)); // 2 min: still a blip
-    assert!(flux_failing(&cond("BuildFailed", "2026-10-11T12:04:00Z"), now));
+    assert!(!flux_failing(&cond("DependencyNotReady", "2026-10-11T11:00:00Z"), now, 300));
+    assert!(!flux_failing(&cond("BuildFailed", "2026-10-11T12:08:00Z"), now, 300)); // 2 min: still a blip
+    assert!(flux_failing(&cond("BuildFailed", "2026-10-11T12:04:00Z"), now, 300));
     let f = |q: &str, line: &str| LineFilter::parse(q).unwrap().matches(line);
     assert!(f("", "anything"));
     assert!(f("Order failed", "{\"msg\":\"order FAILED\"}"));
