@@ -52,6 +52,9 @@ and it idles at around 1% CPU.
   shell (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
   multi-selected rows. Workloads have a −/+ replica stepper; ones scaled by an HPA (or KEDA) link to it
   instead, so you don't fight the autoscaler.
+- **Protected contexts.** Click the lock next to a context in the switcher (⌘K) to turn off deletes,
+  scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work. Handy for
+  production, since actions don't ask for confirmation.
 - **Secrets** stay masked until you click the eye icon.
 - **Native feel.** Follows macOS light and dark mode, remembers window position, sorting, sidebar
   layout, and context and namespace selection.

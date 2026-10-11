@@ -419,6 +419,11 @@ impl Action {
         }
     }
 
+    /// Allowed on protected contexts: Flux reconciles only re-apply what Git already says.
+    fn harmless(self) -> bool {
+        matches!(self, Action::Reconcile | Action::ReconcileWithSource)
+    }
+
     fn color(self) -> u32 {
         if self == Action::Delete { RED } else { DIM }
     }
@@ -672,7 +677,12 @@ fn row_menu(
     let mut actions: Vec<Action> = Action::quick(k, suspended).into_iter().filter(|a| *a != Action::Delete).collect();
     let mut autoscaled = None;
     let mut count = 0;
+    let locked = view.upgrade().is_some_and(|v| v.read(cx).protected.contains(&key.0.name));
+    if locked {
+        actions.retain(|a| a.harmless());
+    }
     if scalable(k.name)
+        && !locked
         && let Some(v) = view.upgrade()
     {
         let this = v.read(cx);
@@ -701,7 +711,22 @@ fn row_menu(
             Box::new(move |this, _, cx| this.goto(kind_ix("HPAs"), hpa_key.clone(), cx)),
         ));
     }
-    for a in actions.into_iter().chain([Action::Delete]) {
+    if locked {
+        menu = menu.separator().item(
+            PopupMenuItem::element(|_, _| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .py(px(3.))
+                    .child(icon("lock", YELLOW).size(px(15.)))
+                    .child(div().text_color(rgb(DIM)).child("Protected: changes are off"))
+            })
+            .disabled(true),
+        );
+    }
+    let delete = (!locked).then_some(Action::Delete);
+    for a in actions.into_iter().chain(delete) {
         if a == Action::Delete {
             menu = menu.separator();
         }
@@ -984,6 +1009,8 @@ struct Explorer {
     from_problems: bool,
     /// Namespaces to show on namespaced pages (empty = all). Persisted in namespaces.json.
     ns_filter: std::collections::BTreeSet<String>,
+    /// Context names where changes are off (lock in the context switcher). Persisted in protected.json.
+    protected: std::collections::BTreeSet<String>,
     ns_open: bool,
     /// Search field of the namespace picker (created on open; needs the window).
     ns_search: Option<Entity<InputState>>,
@@ -1125,6 +1152,7 @@ impl Explorer {
             problems: vec![],
             from_problems: false,
             ns_filter: load_json("namespaces.json"),
+            protected: load_json("protected.json"),
             ns_open: false,
             ns_search: None,
             open_browser: load_json::<HashMap<String, bool>>("settings.json")
@@ -1472,6 +1500,16 @@ impl Explorer {
         .detach();
     }
 
+    fn toggle_protected(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.protected.remove(&name) {
+            self.protected.insert(name);
+        }
+        if let Err(e) = save_json("protected.json", &self.protected) {
+            self.status = format!("Could not save protected contexts: {e}");
+        }
+        cx.notify();
+    }
+
     fn toggle_ctx(&mut self, ctx: Ctx, cx: &mut Context<Self>) {
         match self.active.iter().position(|c| *c == ctx) {
             Some(i) => _ = self.active.remove(i),
@@ -1781,6 +1819,18 @@ impl Explorer {
                     .text_color(rgb(FAINT))
                     .child("⌘-click toggle · ⇧-click range · ⌘A all"),
             )
+            .when(self.picked.iter().any(|k| self.protected.contains(&k.0.name)), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(rgb(YELLOW))
+                        .child(icon("lock", YELLOW).size(px(12.)))
+                        .child("protected rows are skipped"),
+                )
+            })
             .child(div().flex_1())
             .children(actions.into_iter().enumerate().map(|(i, a)| {
                 button(("bulk", i), a.icon(), a.label(), if a == Action::Delete { RED } else { DIM })
@@ -3719,6 +3769,10 @@ impl Explorer {
         let (kind, Some((ctx, ns, name))) = (kind_at(self.kind), self.selected.clone()) else {
             return;
         };
+        if self.protected.contains(&ctx.name) {
+            self.status = format!("{} is protected; unlock it in the context switcher (⌘K) to save", ctx.name);
+            return cx.notify();
+        }
         let Some(ed) = self.current_editor() else { return };
         if ed.saving {
             return;
@@ -4063,6 +4117,13 @@ impl Explorer {
     /// Runs an action on an object; destructive ones ask first.
     /// Runs an action on an object right away (no confirmation, by request).
     fn act(&mut self, action: Action, kind_ix_: usize, key: Key, cx: &mut Context<Self>) {
+        if !action.harmless() && self.protected.contains(&key.0.name) {
+            self.status = format!(
+                "{} is protected; unlock it in the context switcher (⌘K) to make changes",
+                key.0.name
+            );
+            return cx.notify();
+        }
         // `flux reconcile --with-source`: refresh the source(s) first, then the object.
         let sources: Vec<(usize, String, String)> = match action {
             Action::ReconcileWithSource => self.cached_row(kind_ix_, &key).map(|r| flux_sources(&r)).unwrap_or_default(),
@@ -5731,6 +5792,27 @@ impl Explorer {
                     let (state, color) = Self::ctx_state(c);
                     d.child(div().flex_none().text_xs().text_color(rgb(color)).child(state))
                 })
+                .child({
+                    // Lock: no deletes, scaling, redeploys or YAML saves in this context.
+                    let locked = self.protected.contains(&c.name);
+                    let name = c.name.clone();
+                    div()
+                        .id(("protect", i))
+                        .flex_none()
+                        .p_0p5()
+                        .rounded_sm()
+                        .hover(|s| s.bg(rgb(SURFACE)))
+                        .tooltip(tip(if locked {
+                            "Protected: changes are off. Click to allow changes"
+                        } else {
+                            "Protect: turn off deletes, scaling, redeploys and YAML saves"
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_protected(name.clone(), cx);
+                        }))
+                        .child(icon("lock", if locked { YELLOW } else { 0x34374a }).size(px(13.)))
+                })
         });
         div()
             .id("ctx-picker")
@@ -6762,7 +6844,15 @@ impl Explorer {
                                         if ns.is_empty() { "cluster-scoped" } else { &ns }
                                     ))),
                             )
-                            .children(self.scale_control(cx))
+                            .children(if self.protected.contains(&ctx.name) {
+                                Some(
+                                    button("protected", "lock", "Protected", YELLOW)
+                                        .tooltip(tip("Changes are off for this context (lock in the context switcher)"))
+                                        .into_any_element(),
+                                )
+                            } else {
+                                self.scale_control(cx)
+                            })
                             .child(icon_button("copy", "copy", DIM, "Copy").on_click(cx.listener(|this, _, _, cx| {
                                 let text = match (this.tab, this.current_editor()) {
                                     (Tab::Yaml, Some(ed)) => ed.state.read(cx).value().to_string(),
@@ -6778,6 +6868,9 @@ impl Explorer {
                                 let mut actions = Action::quick(kind, self.selected_row().is_some_and(|r| suspended(&r.obj)));
                                 if !actions.contains(&Action::Delete) {
                                     actions.push(Action::Delete);
+                                }
+                                if self.protected.contains(&ctx.name) {
+                                    actions.retain(|a| a.harmless());
                                 }
                                 let (kind_ix, sel) = (self.kind, self.selected.clone().unwrap_or_default());
                                 actions
