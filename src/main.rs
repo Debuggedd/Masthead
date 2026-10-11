@@ -292,6 +292,7 @@ icons!(
     "badge-check",
     "link-2",
     "minus",
+    "bug",
 );
 
 struct Assets;
@@ -596,6 +597,7 @@ fn row_menu(
     let forward_cmd = forward_first;
     if let Some((pod, container)) = shell {
         let (ctx, ns) = (key.0.clone(), key.1.clone());
+        let (pod2, container2, ctx2, ns2) = (pod.clone(), container.clone(), ctx.clone(), ns.clone());
         menu = menu.item(entry(
             "Open shell".into(),
             container.clone(),
@@ -604,6 +606,33 @@ fn row_menu(
             false,
             Box::new(move |this, _, cx| {
                 this.status = open_shell(&ctx, &ns, &pod, &container);
+                cx.notify();
+            }),
+        ));
+        if k.name == "Pods" {
+            menu = menu.item(entry(
+                "Debug container".into(),
+                DEBUG_IMAGE.into(),
+                "bug",
+                GREEN,
+                false,
+                Box::new(move |this, _, cx| {
+                    this.status = open_debug(&ctx2, &ns2, &pod2, &container2);
+                    cx.notify();
+                }),
+            ));
+        }
+    }
+    if k.name == "Nodes" {
+        let (ctx, node) = (key.0.clone(), key.2.clone());
+        menu = menu.item(entry(
+            "Node shell".into(),
+            "root".into(),
+            "square-terminal",
+            GREEN,
+            false,
+            Box::new(move |this, _, cx| {
+                this.status = open_node_shell(&ctx, &node);
                 cx.notify();
             }),
         ));
@@ -8114,42 +8143,88 @@ fn restore_window(cx: &App) -> Option<(WindowBounds, Option<gpui::DisplayId>)> {
     Some((bounds, Some(display.id())))
 }
 
-/// Opens `kubectl exec -it` into a container in a new Ghostty window (Terminal.app if Ghostty isn't
-/// installed), so you get your own terminal's fonts, scrollback and copy/paste. Returns a status line.
+/// Image for debug containers and node shells (busybox: small, has sh and nsenter).
+// ponytail: fixed public image; make it a setting if a cluster only pulls from a private registry.
+const DEBUG_IMAGE: &str = "busybox:1.36";
+const PREFER_BASH: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+
+/// Opens `kubectl exec -it` into a container in a new Ghostty tab. Returns a status line.
 fn open_shell(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
-    let Some(kubectl) = find_in_path("kubectl") else {
-        return "Open shell: kubectl not found in PATH".into();
-    };
-    let shell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
-    let args: Vec<String> = [
-        kubectl.to_string_lossy().as_ref(),
-        "--kubeconfig",
-        &ctx.file.to_string_lossy(),
-        "--context",
-        &ctx.name,
-        "exec",
-        "-it",
+    let args = ["exec", "-it", "-n", ns, pod, "-c", container, "--", "sh", "-c", PREFER_BASH];
+    match open_kubectl(ctx, &format!("{pod}/{container} · {}", ctx.name), &args) {
+        Ok(()) => format!("Opening shell in {pod}/{container}…"),
+        Err(e) => format!("Open shell failed: {e}"),
+    }
+}
+
+/// `kubectl debug`: an ephemeral busybox container in the pod, sharing the target container's processes
+/// (handy for distroless images without a shell). Ephemeral containers stay listed until the pod restarts.
+fn open_debug(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
+    let image = format!("--image={DEBUG_IMAGE}");
+    let target = format!("--target={container}");
+    let args = ["debug", "-it", "-n", ns, pod, &image, &target, "--profile=general", "--", "sh"];
+    match open_kubectl(ctx, &format!("debug {pod} · {}", ctx.name), &args) {
+        Ok(()) => format!("Starting a debug container in {pod}…"),
+        Err(e) => format!("Debug failed: {e}"),
+    }
+}
+
+/// A root shell on a node: a privileged pod on that node that enters the host's namespaces (like
+/// kubectl-node-shell). `--rm` deletes the pod when the shell exits. Runs in kube-system, where Pod
+/// Security admission allows privileged pods.
+fn open_node_shell(ctx: &Ctx, node: &str) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = format!("masthead-shell-{}", secs % 1_000_000);
+    let overrides = serde_json::json!({"spec": {
+        "nodeName": node, "hostPID": true, "hostNetwork": true, "hostIPC": true,
+        "tolerations": [{"operator": "Exists"}],
+        "containers": [{
+            "name": "shell", "image": DEBUG_IMAGE, "stdin": true, "tty": true,
+            "securityContext": {"privileged": true},
+            "command": ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", PREFER_BASH],
+        }],
+    }})
+    .to_string();
+    let overrides = format!("--overrides={overrides}");
+    let image = format!("--image={DEBUG_IMAGE}");
+    let args = [
+        "run",
+        &name,
         "-n",
-        ns,
-        pod,
-        "-c",
-        container,
-        "--",
-        "sh",
-        "-c",
-        shell,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+        "kube-system",
+        "--rm",
+        "-it",
+        "--restart=Never",
+        &image,
+        &overrides,
+    ];
+    match open_kubectl(ctx, &format!("node {node} · {}", ctx.name), &args) {
+        Ok(()) => format!("Opening a shell on node {node}…"),
+        Err(e) => format!("Node shell failed: {e}"),
+    }
+}
+
+/// Runs kubectl (for this context) in a new Ghostty tab (Terminal.app if Ghostty isn't installed), so
+/// you get your own terminal's fonts, scrollback and copy/paste.
+fn open_kubectl(ctx: &Ctx, title: &str, kubectl_args: &[&str]) -> Result<(), String> {
+    let kubectl = find_in_path("kubectl").ok_or("kubectl not found in PATH")?;
+    let mut args: Vec<String> = vec![
+        kubectl.to_string_lossy().into(),
+        "--kubeconfig".into(),
+        ctx.file.to_string_lossy().into(),
+        "--context".into(),
+        ctx.name.clone(),
+    ];
+    args.extend(kubectl_args.iter().map(|a| a.to_string()));
     // One shell-quoted command line (both terminals take a line for their shell to run). It names the
     // tab first (OSC 2 title escape), then execs kubectl; wrapped in `sh -c` because Ghostty runs its
     // command as `exec <command>`, which a `;` sequence would break.
     let quote = |a: &str| format!("'{}'", a.replace('\'', "'\\''"));
-    let title = format!("{pod}/{container} · {}", ctx.name);
     let inner = format!(
         "printf '\\033]2;%s\\007' {}; exec {}",
-        quote(&title),
+        quote(title),
         args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
     );
     let line = format!("sh -c {}", quote(&inner));
@@ -8178,11 +8253,11 @@ fn open_shell(ctx: &Ctx, ns: &str, pod: &str, container: &str) -> String {
             as_applescript(&line)
         )
     };
-    let res = std::process::Command::new("osascript").args(["-e", &script]).spawn();
-    match res {
-        Ok(_) => format!("Opening shell in {pod}/{container}…"),
-        Err(e) => format!("Open shell failed: {e}"),
-    }
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn find_in_path(bin: &str) -> Option<std::path::PathBuf> {
@@ -8534,6 +8609,22 @@ fn kubectl_commands(k: &Kind, key: &Key, shell: Option<&(String, String)>, port:
     }
     if let Some((pod, container)) = shell {
         out.push(("Shell", format!("{base} exec -it {} -c {} -- sh", q(pod), q(container))));
+        if k.name == "Pods" {
+            out.push((
+                "Debug container",
+                format!(
+                    "{base} debug -it {} --image={DEBUG_IMAGE} --target={} --profile=general -- sh",
+                    q(pod),
+                    q(container)
+                ),
+            ));
+        }
+    }
+    if k.name == "Nodes" {
+        out.push((
+            "Debug node",
+            format!("{base} debug node/{} -it --image={DEBUG_IMAGE} --profile=sysadmin", q(name)),
+        ));
     }
     if let Some(port) = port {
         out.push(("Port forward", format!("{base} port-forward {obj} {port}:{port}")));

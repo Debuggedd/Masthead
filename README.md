@@ -162,6 +162,9 @@ Settings are stored in `~/Library/Application Support/Masthead/`.
   end when the app quits.
 - **Shell**: `kubectl exec -it` opens in a new tab of your running Ghostty through its AppleScript API.
   If Ghostty isn't installed, Terminal.app is used.
+- **Debug shells**: on a pod, "Debug container" adds an ephemeral busybox container that shares the target
+  container's processes (`kubectl debug`), for images without a shell. On a node, "Node shell" starts a
+  privileged pod on that node and enters the host as root; the pod is removed when you exit.
 - **Flux**: Reconcile, Reconcile with source (refreshes the GitRepository, OCIRepository, HelmRepository
   or HelmChart first), Suspend and Resume. Kustomizations and HelmReleases list their managed objects.
 - **Secrets / ConfigMaps**: every key is listed, and values can be selected and scrolled. Secret values
