@@ -18,7 +18,6 @@
 > [Claude Code](https://claude.com/claude-code) through conversation, with no hand-written code. A human
 > drove it: chose the features, tested them against real clusters and reported what looked or felt wrong.
 > Treat it as an experiment, and read the code before trusting it with a production cluster.
-> Delete and redeploy actions run without a confirmation dialog.
 
 ## Why
 
@@ -55,8 +54,9 @@ and it idles at around 1% CPU.
   multi-selected rows. Scale opens a small dialog for the replica count; workloads scaled by an HPA (or
   KEDA) link to it instead, so you don't fight the autoscaler.
 - **Protected contexts.** Click the lock next to a context in the switcher (⌘K) to turn off deletes,
-  scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work. Handy for
-  production, since actions don't ask for confirmation.
+  scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work.
+- **Confirmations.** Deletes and redeploys (also in bulk) ask first in a small dialog: Enter confirms, Esc
+  cancels. You can turn this off in Settings.
 - **Secrets** stay masked until you click the eye icon.
 - **Settings** (⌘,): theme (system, light or dark), automatic updates, kubeconfig files, a display
   name and colour per context, protected and muted contexts, which problems notify you (warnings too,

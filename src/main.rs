@@ -842,6 +842,13 @@ struct FwdTarget {
 }
 
 /// Port-forward dialog state (Aptakube-style: local port → container port dropdown, open-in-browser).
+/// An action waiting for "are you sure?", for one object or every picked row.
+struct Confirm {
+    action: Action,
+    kind: usize,
+    keys: Vec<Key>,
+}
+
 /// The Scale dialog: one object, or every picked row (then `current` is None).
 struct ScaleModal {
     kind: usize,
@@ -1035,6 +1042,8 @@ struct Explorer {
     /// The "Port forward" dialog, when open.
     fwd_modal: Option<FwdModal>,
     scale_modal: Option<ScaleModal>,
+    /// "Delete …?" / "Redeploy …?" waiting for an answer.
+    confirm: Option<Confirm>,
     /// Actions sent but not answered yet, so a double click doesn't send them twice.
     in_flight: std::collections::HashSet<(Action, usize, Key)>,
     /// Everything on the Settings page (settings.json).
@@ -1203,6 +1212,7 @@ impl Explorer {
             forwards: vec![],
             fwd_modal: None,
             scale_modal: None,
+            confirm: None,
             in_flight: Default::default(),
             prefs: settings::shared(),
             settings_mode: false,
@@ -1727,6 +1737,11 @@ impl Explorer {
                     self.open_fwd_modal(r.clone(), 0, cx);
                     Tab::Overview
                 }
+                "delete" => {
+                    // Dev hook for screenshots: ask to delete this object (nothing happens without a click).
+                    self.act(Action::Delete, self.kind, key.clone(), cx);
+                    Tab::Overview
+                }
                 "scale" => {
                     // Dev hook for screenshots: open the Scale dialog.
                     self.open_scale_modal(self.kind, vec![key.clone()], cx);
@@ -1894,10 +1909,10 @@ impl Explorer {
     fn bulk(&mut self, action: Action, cx: &mut Context<Self>) {
         let keys: Vec<Key> = std::mem::take(&mut self.picked).into_iter().collect();
         let n = keys.len();
-        for key in keys {
-            self.act(action, self.kind, key, cx);
+        self.act_many(action, self.kind, keys, cx);
+        if self.confirm.is_none() {
+            self.status = format!("{}: {n} objects…", action.label());
         }
-        self.status = format!("{}: {n} objects…", action.label());
         cx.notify();
     }
 
@@ -2922,6 +2937,121 @@ impl Explorer {
         }
         self.picked.clear();
         cx.notify();
+    }
+
+    /// "Delete deployment api?": what, where, what happens, Cancel / the action (Enter confirms, Esc cancels).
+    fn confirm_dialog(&self, c: &Confirm, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = kind_at(c.kind);
+        let verb = c.action.label();
+        let (title, sub) = match &c.keys[..] {
+            [(ctx, ns, name)] => (
+                format!("{verb} {} {name}?", kind.kind.to_lowercase()),
+                [self.ctx_label(ctx), ns.clone()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ),
+            keys => {
+                let ctxs: std::collections::BTreeSet<String> = keys.iter().map(|k| self.ctx_label(&k.0)).collect();
+                (
+                    format!("{verb} {} {}?", keys.len(), kind.name.to_lowercase()),
+                    ctxs.into_iter().collect::<Vec<_>>().join(", "),
+                )
+            }
+        };
+        let what = match c.action {
+            Action::Delete if kind.name == "Pods" => "Its controller (if any) will start a replacement.",
+            Action::Delete => "This can't be undone.",
+            Action::Redeploy => "Pods are replaced one at a time (rolling restart).",
+            _ => "",
+        };
+        let danger = c.action == Action::Delete;
+        let names: Vec<String> = c.keys.iter().take(6).map(|k| k.2.clone()).collect();
+        div()
+            .id("confirm-modal")
+            .w(px(420.))
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(0x34374a))
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .px_6()
+                    .pt_5()
+                    .pb_4()
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt_0p5()
+                            .child(icon(c.action.icon(), if danger { RED } else { YELLOW }).size(px(20.))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_lg().font_weight(FontWeight::BOLD).child(title))
+                            .when(!sub.is_empty(), |d| d.child(div().text_sm().text_color(rgb(DIM)).child(sub)))
+                            .when(c.keys.len() > 1, |d| {
+                                let more = c.keys.len().saturating_sub(names.len());
+                                d.child(div().pt_1().text_xs().text_color(rgb(FAINT)).child(format!(
+                                    "{}{}",
+                                    names.join(", "),
+                                    if more > 0 { format!(" and {more} more") } else { String::new() }
+                                )))
+                            })
+                            .child(div().pt_2().text_sm().text_color(rgb(TEXT)).child(what)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .px_6()
+                    .pb_5()
+                    .child(
+                        div()
+                            .id("confirm-cancel")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm = None;
+                                cx.notify();
+                            }))
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-ok")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(if danger { 0xd9455f } else { 0x4c6fdc }))
+                            .text_color(gpui::white())
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_ok(cx)))
+                            .child(verb),
+                    ),
+            )
     }
 
     /// The Scale dialog: which object(s), a replica count with −/+, Scale.
@@ -4522,7 +4652,32 @@ impl Explorer {
 
     /// Runs an action on an object; destructive ones ask first.
     /// Runs an action on an object right away (no confirmation, by request).
+    /// Runs an action, asking first (in-app dialog) for deletes and redeploys unless that's turned off.
     fn act(&mut self, action: Action, kind_ix_: usize, key: Key, cx: &mut Context<Self>) {
+        self.act_many(action, kind_ix_, vec![key], cx);
+    }
+
+    fn act_many(&mut self, action: Action, kind: usize, keys: Vec<Key>, cx: &mut Context<Self>) {
+        let risky = matches!(action, Action::Delete | Action::Redeploy);
+        if risky && self.prefs.confirm && !keys.is_empty() {
+            self.confirm = Some(Confirm { action, kind, keys });
+            self.refocus = true; // so Enter / Esc reach the dialog
+            return cx.notify();
+        }
+        for key in keys {
+            self.run_action(action, kind, key, cx);
+        }
+    }
+
+    fn confirm_ok(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.confirm.take() else { return };
+        for key in c.keys {
+            self.run_action(c.action, c.kind, key, cx);
+        }
+        cx.notify();
+    }
+
+    fn run_action(&mut self, action: Action, kind_ix_: usize, key: Key, cx: &mut Context<Self>) {
         if !action.harmless() && self.protected.contains(&key.0.name) {
             self.status = format!(
                 "{} is protected; unlock it in the context switcher (⌘K) to make changes",
@@ -6003,6 +6158,14 @@ impl Explorer {
         // Typing inside the YAML editor belongs to the editor, not the table filter.
         if !self.focus.is_focused(window) {
             return;
+        }
+        if self.confirm.is_some() {
+            match ks.key.as_str() {
+                "escape" => self.confirm = None,
+                "enter" => self.confirm_ok(cx),
+                _ => {}
+            }
+            return cx.notify();
         }
         // Any key other than select-all/copy drops the selection.
         let all = std::mem::take(&mut self.filter_all);
@@ -7801,6 +7964,30 @@ impl Render for Explorer {
                             }),
                         )
                         .child(self.ns_picker(cx)),
+                )
+            })
+            .when(self.confirm.is_some(), |d| {
+                let dialog = self.confirm.as_ref().map(|c| self.confirm_dialog(c, cx).into_any_element());
+                d.child(
+                    div()
+                        .id("confirm-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.45))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.confirm = None;
+                                cx.notify();
+                            }),
+                        )
+                        .children(dialog),
                 )
             })
             .when(self.scale_modal.is_some(), |d| {

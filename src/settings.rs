@@ -26,6 +26,8 @@ pub struct Prefs {
     pub log_timestamps: bool,
     pub log_since: Option<i64>,
     pub open_browser: bool,
+    /// Ask before deleting or redeploying.
+    pub confirm: bool,
     /// Built-in kinds hidden from the sidebar (by name).
     pub hidden_kinds: std::collections::BTreeSet<String>,
     /// Per context name: display name, color, notifications muted.
@@ -56,6 +58,7 @@ impl Default for Prefs {
             log_timestamps: false,
             log_since: None,
             open_browser: false,
+            confirm: true,
             hidden_kinds: Default::default(),
             contexts: Default::default(),
         }
@@ -322,6 +325,11 @@ impl Explorer {
                     },
                     cx,
                 ),
+            ))
+            .child(row(
+                "Ask before deleting or redeploying",
+                "A confirmation dialog; Enter confirms, Esc cancels",
+                self.toggle("confirm", p.confirm, |p| p.confirm = !p.confirm, cx),
             ))
             .child(row(
                 "Check for updates automatically",
