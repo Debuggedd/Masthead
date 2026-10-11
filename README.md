@@ -90,10 +90,10 @@ cargo run --release
 
 `rsvg-convert` (`brew install librsvg`) is optional. It renders a sharper app icon from the SVG.
 
-A self-built app is ad-hoc signed, so macOS asks for permissions again after every rebuild, for example
-when a kubeconfig is in `~/Documents`. To keep those permissions across rebuilds, create a code-signing
-certificate called **"Masthead Local Signing"** in Keychain Access (Certificate Assistant → Create a
-Certificate → Code Signing). `bundle.sh` uses it automatically.
+Releases are signed with a fixed (self-signed) certificate, so macOS remembers permissions such as
+Documents access across updates. A self-built app is ad-hoc signed instead, so macOS asks again after
+every rebuild. To avoid that, create a code-signing certificate called **"Masthead Signing"** in Keychain
+Access (Certificate Assistant → Create a Certificate → Code Signing). `bundle.sh` uses it automatically.
 
 ## Usage
 

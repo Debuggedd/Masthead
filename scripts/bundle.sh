@@ -45,10 +45,10 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Sign with the local "Masthead Local Signing" certificate when present: macOS privacy permissions
-# (e.g. Documents access for kubeconfigs) are tied to the signer, so they survive rebuilds. An ad-hoc
-# signature changes every build, so macOS would ask again after each one.
-identity=$(security find-identity -p codesigning 2>/dev/null | awk '/"Masthead Local Signing"/ {print $2; exit}')
+# Sign with the "Masthead Signing" certificate when present (your keychain, or the release workflow's):
+# macOS privacy permissions (Documents access, controlling Ghostty) are tied to the signer, so they
+# survive rebuilds and updates. An ad-hoc signature changes every build, so macOS would ask again each time.
+identity=$(security find-identity -p codesigning 2>/dev/null | awk '/"Masthead Signing"/ {print $2; exit}')
 codesign --force --deep -s "${identity:--}" "$app"
 echo "$app"
 

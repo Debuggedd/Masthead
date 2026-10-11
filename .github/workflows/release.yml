@@ -22,7 +22,25 @@ jobs:
           shared-key: release  # restores the cache CI saves from main
           save-if: false
       - run: brew install librsvg
+      # Every release is signed with the same certificate (repo secrets), so macOS keeps the app's
+      # permissions across updates. bundle.sh picks it up from this temporary keychain.
+      - name: Signing keychain
+        env:
+          P12: ${{ secrets.MASTHEAD_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.MASTHEAD_SIGNING_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"; pw=$(uuidgen)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/signing.p12"
       - run: scripts/bundle.sh
+      - name: Signed with the release certificate
+        run: codesign -dvv dist/Masthead.app 2>&1 | grep -q "Authority=Masthead Signing"
       - run: ditto -c -k --keepParent dist/Masthead.app Masthead-macos-arm64.zip
       - name: Disk image (app + Applications shortcut to drag it onto)
         run: |
