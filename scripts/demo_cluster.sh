@@ -39,8 +39,9 @@ for c in staging production; do
     --values=/dev/stdin <<EOF
 controller: {service: {type: ClusterIP}, ingressClassResource: {default: true}}
 EOF
-  replicas=2; [ $c = production ] && replicas=3
-  sed "s/REPLICAS/$replicas/" <<'EOF' | kubectl apply -f -
+  # Staging runs ahead of production (newer image, debug logs): something for Compare to find.
+  replicas=2 tag=6.7.1 level=debug; [ $c = production ] && replicas=3 tag=6.7.0 level=info
+  sed "s/REPLICAS/$replicas/; s/IMAGE_TAG/$tag/; s/LOG_LEVEL_VALUE/$level/; s/CLUSTER/$c/" <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: Namespace
 metadata: {name: shop}
@@ -49,7 +50,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata: {name: api-config, namespace: shop}
 data:
-  LOG_LEVEL: info
+  LOG_LEVEL: LOG_LEVEL_VALUE
   FEATURE_FLAGS: "checkout-v2,recommendations"
   config.yaml: |
     server:
@@ -75,9 +76,10 @@ spec:
     spec:
       containers:
       - name: api
-        image: ghcr.io/stefanprodan/podinfo:6.7.1
+        image: ghcr.io/stefanprodan/podinfo:IMAGE_TAG
         command: [./podinfo, --port=9898, --level=debug]
         ports: [{containerPort: 9898, name: http}]
+        env: [{name: PUBLIC_URL, value: "https://api.CLUSTER.shop.example"}]
         envFrom: [{configMapRef: {name: api-config}}, {secretRef: {name: api-secrets}}]
         resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
 ---

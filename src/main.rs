@@ -1,3 +1,4 @@
+mod compare;
 mod k8s;
 mod settings;
 mod update;
@@ -616,8 +617,62 @@ fn row_menu(
     if has_logs(k.name) {
         menu = menu.item(entry("Logs".into(), String::new(), "scroll-text", ACCENT, false, open(Tab::Logs)));
     }
+    // Compare with the same object elsewhere: a direct entry for one other copy, a submenu for several.
+    let targets: Vec<(Key, String)> = view
+        .upgrade()
+        .map(|v| {
+            let this = v.read(cx);
+            this.compare_targets(kind, &key)
+                .into_iter()
+                .map(|t| (t.clone(), this.place(&t)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let compare_with = |target: Key| -> MenuFn {
+        let key = key.clone();
+        Box::new(move |this, _, cx| {
+            this.comparing = Some(Comparing {
+                kind,
+                a: key.clone(),
+                b: target.clone(),
+                mask: true,
+            });
+            this.refocus = true;
+            cx.notify();
+        })
+    };
+    if let [(target, place)] = &targets[..] {
+        menu = menu.item(entry(
+            "Compare with".into(),
+            place.clone(),
+            "arrow-left-right",
+            ACCENT,
+            false,
+            compare_with(target.clone()),
+        ));
+    } else if !targets.is_empty() {
+        let items: Vec<(String, std::rc::Rc<MenuFn>)> = targets
+            .into_iter()
+            .map(|(t, place)| (place, std::rc::Rc::new(compare_with(t))))
+            .collect();
+        let sub_view = view.clone();
+        menu = menu.submenu("Compare with", window, cx, move |sub, _, _| {
+            let mut sub = sub.min_w(px(220.));
+            for (place, f) in &items {
+                let (view, f, place) = (sub_view.clone(), f.clone(), place.clone());
+                sub = sub.item(
+                    PopupMenuItem::element(move |_, _| div().py(px(3.)).text_color(rgb(TEXT)).child(place.clone())).on_click(
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| f(this, window, cx)).ok();
+                        },
+                    ),
+                );
+            }
+            sub
+        });
+    }
 
-    // Tools
+    // Tools. Debug containers and node shells create things in the cluster, so not on protected contexts.
     menu = menu.separator();
     let shell_cmd = shell.clone();
     let forward_cmd = forward_first;
@@ -863,6 +918,14 @@ struct Confirm {
     keys: Vec<Key>,
 }
 
+/// Compare dialog: the same kind of object in two places. `mask` hides cluster/namespace names.
+struct Comparing {
+    kind: usize,
+    a: Key,
+    b: Key,
+    mask: bool,
+}
+
 /// The Scale dialog: one object, or every picked row (then `current` is None).
 struct ScaleModal {
     kind: usize,
@@ -1058,6 +1121,7 @@ struct Explorer {
     scale_modal: Option<ScaleModal>,
     /// "Delete …?" / "Redeploy …?" waiting for an answer.
     confirm: Option<Confirm>,
+    comparing: Option<Comparing>,
     /// Actions sent but not answered yet, so a double click doesn't send them twice.
     in_flight: std::collections::HashSet<(Action, usize, Key)>,
     /// Everything on the Settings page (settings.json).
@@ -1232,6 +1296,7 @@ impl Explorer {
             fwd_modal: None,
             scale_modal: None,
             confirm: None,
+            comparing: None,
             in_flight: Default::default(),
             prefs: settings::shared(),
             settings_mode: false,
@@ -1747,6 +1812,18 @@ impl Explorer {
                 "yaml" => Tab::Yaml,
                 "events" => Tab::Events,
                 "map" => Tab::Map,
+                "compare" => {
+                    // Dev hook for screenshots: compare with the first other copy.
+                    if let Some(b) = self.compare_targets(self.kind, &key).into_iter().next() {
+                        self.comparing = Some(Comparing {
+                            kind: self.kind,
+                            a: key,
+                            b,
+                            mask: true,
+                        });
+                    }
+                    return cx.notify();
+                }
                 "menu" => {
                     self.menu_request = Some((self.kind, key.clone(), gpui::point(px(520.), px(140.))));
                     return cx.notify();
@@ -1946,6 +2023,21 @@ impl Explorer {
             actions.insert(1, Action::Uncordon);
         }
         actions.push(Action::Delete);
+        let compare = (self.picked.len() == 2).then(|| {
+            button("bulk-compare", "arrow-left-right", "Compare", DIM).on_click(cx.listener(|this, _, _, cx| {
+                let mut keys = this.picked.iter().cloned();
+                if let (Some(a), Some(b)) = (keys.next(), keys.next()) {
+                    this.comparing = Some(Comparing {
+                        kind: this.kind,
+                        a,
+                        b,
+                        mask: true,
+                    });
+                    this.refocus = true;
+                }
+                cx.notify();
+            }))
+        });
         let scale = scalable(kind.name).then(|| {
             button("bulk-scale", "arrow-up-down", "Scale…", DIM).on_click(cx.listener(|this, _, _, cx| {
                 let keys: Vec<Key> = this.picked.iter().cloned().collect();
@@ -1990,6 +2082,7 @@ impl Explorer {
                 )
             })
             .child(div().flex_1())
+            .children(compare)
             .children(scale)
             .children(actions.into_iter().enumerate().map(|(i, a)| {
                 button(("bulk", i), a.icon(), a.label(), if a == Action::Delete { RED } else { DIM })
@@ -2959,6 +3052,233 @@ impl Explorer {
         }
         self.picked.clear();
         cx.notify();
+    }
+
+    /// Same object in other places (other active clusters, other namespaces), for "Compare with".
+    fn compare_targets(&self, kind: usize, key: &Key) -> Vec<Key> {
+        let cache = CACHE.lock().unwrap();
+        let mut keys: Vec<Key> = self
+            .active
+            .iter()
+            .filter_map(|ctx| cache.get(&(ctx.clone(), kind)))
+            .flat_map(|s| s.rows.values())
+            .filter(|r| r.name == key.2 && (r.ctx != key.0 || r.ns != key.1))
+            .map(|r| (r.ctx.clone(), r.ns.clone(), r.name.clone()))
+            .collect();
+        keys.sort_by(|a, b| (&a.0.name, &a.1).cmp(&(&b.0.name, &b.1)));
+        keys
+    }
+
+    /// "staging · shop" for one side of a comparison.
+    fn place(&self, key: &Key) -> String {
+        [self.ctx_label(&key.0), key.1.clone()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// What differs between two copies of an object: one line per field (path, this side, that side).
+    /// Live: recomputed from the cache on every render.
+    fn compare_dialog(&self, c: &Comparing, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = kind_at(c.kind);
+        let (ra, rb) = (self.cached_row(c.kind, &c.a), self.cached_row(c.kind, &c.b));
+        let side = |key: &'_ Key, row: &'_ Option<Arc<Row>>| -> Option<(Value, String, String)> {
+            Some((row.as_ref()?.obj.clone(), key.0.name.clone(), key.1.clone()))
+        };
+        let (sa, sb) = (side(&c.a, &ra), side(&c.b, &rb));
+        let (changes, hidden) = match (&sa, &sb) {
+            (Some((oa, ca, na)), Some((ob, cb, nb))) => {
+                let a = compare::Side { obj: oa, ctx: ca, ns: na };
+                let b = compare::Side { obj: ob, ctx: cb, ns: nb };
+                let shown = compare::compare(kind.kind, &a, &b, c.mask);
+                let hidden = if c.mask {
+                    compare::compare(kind.kind, &a, &b, false).len().saturating_sub(shown.len())
+                } else {
+                    0
+                };
+                (Some(shown), hidden)
+            }
+            _ => (None, 0),
+        };
+        let title = if c.a.2 == c.b.2 {
+            format!("Compare {} {}", kind.kind.to_lowercase(), c.a.2)
+        } else {
+            format!("Compare {} {} and {}", kind.kind.to_lowercase(), c.a.2, c.b.2)
+        };
+        let sub = match &changes {
+            None => "One of them no longer exists".to_string(),
+            Some(ch) if ch.is_empty() => "No differences".to_string(),
+            Some(ch) => format!("{} difference{}", ch.len(), if ch.len() == 1 { "" } else { "s" }),
+        };
+        // Long values (config files) are cut; newlines shown as ⏎ so each field stays one block.
+        let show = |v: &Option<String>| -> (String, u32) {
+            match v {
+                None => ("—".into(), FAINT),
+                Some(v) => {
+                    let mut t: String = v.replace('\n', " ⏎ ").chars().take(400).collect();
+                    if v.chars().count() > 400 {
+                        t.push('…');
+                    }
+                    (t, TEXT)
+                }
+            }
+        };
+        let head = |key: &Key| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(div().flex_none().size(px(8.)).rounded_sm().bg(rgb(self.ctx_color(&key.0))))
+                .child(div().truncate().child(self.place(key)))
+        };
+        let rows = changes.iter().flatten().enumerate().map(|(i, ch)| {
+            let ((a, ca), (b, cb)) = (show(&ch.a), show(&ch.b));
+            div()
+                .id(("cmp", i))
+                .flex()
+                .items_start()
+                .gap_4()
+                .px_6()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(ROWLINE))
+                .child(
+                    div()
+                        .w(px(300.))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .pt_0p5()
+                        .child(ch.path.clone()),
+                )
+                .child(div().flex_1().min_w_0().text_sm().text_color(rgb(ca)).child(a))
+                .child(div().flex_1().min_w_0().text_sm().text_color(rgb(cb)).child(b))
+        });
+        let mask = c.mask;
+        div()
+            .id("compare-modal")
+            .w(px(980.))
+            .max_w(relative(0.92))
+            .max_h(relative(0.85))
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(0x34374a))
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .px_6()
+                    .pt_5()
+                    .pb_3()
+                    .child(div().flex_none().mt_0p5().child(icon("arrow-left-right", ACCENT).size(px(20.))))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_lg().font_weight(FontWeight::BOLD).truncate().child(title))
+                            .child(div().text_sm().text_color(rgb(DIM)).child(sub)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .px_6()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(FAINT))
+                    .child(div().w(px(300.)).flex_none().child("Field"))
+                    .child(head(&c.a))
+                    .child(head(&c.b)),
+            )
+            .child(
+                div()
+                    .id("compare-list")
+                    .flex_1()
+                    .min_h(px(80.))
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .when(changes.as_ref().is_some_and(|c| c.is_empty()), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .py_8()
+                                .text_color(rgb(DIM))
+                                .child(icon("circle-check", GREEN).size(px(16.)))
+                                .child("Same spec, data, labels and annotations"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_6()
+                    .py_4()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .id("compare-mask")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .tooltip(tip(format!(
+                                "Treat the cluster and namespace names (and words only one of them has) as equal, e.g. {} in hostnames",
+                                compare::CLUSTER
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(c) = &mut this.comparing {
+                                    c.mask = !mask;
+                                }
+                                cx.notify();
+                            }))
+                            .child(checkbox(mask))
+                            .child(div().text_sm().child("Ignore cluster and namespace names")),
+                    )
+                    .when(hidden > 0, |d| {
+                        d.child(div().text_xs().text_color(rgb(FAINT)).child(format!("{hidden} hidden")))
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("compare-close")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.comparing = None;
+                                cx.notify();
+                            }))
+                            .child("Close"),
+                    ),
+            )
     }
 
     /// "Delete deployment api?": what, where, what happens, Cancel / the action (Enter confirms, Esc cancels).
@@ -6196,6 +6516,12 @@ impl Explorer {
         if !self.focus.is_focused(window) {
             return;
         }
+        if self.comparing.is_some() {
+            if ks.key == "escape" {
+                self.comparing = None;
+            }
+            return cx.notify();
+        }
         if self.confirm.is_some() {
             match ks.key.as_str() {
                 "escape" => self.confirm = None,
@@ -8078,6 +8404,30 @@ impl Render for Explorer {
                             }),
                         )
                         .child(self.ns_picker(cx)),
+                )
+            })
+            .when(self.comparing.is_some(), |d| {
+                let dialog = self.comparing.as_ref().map(|c| self.compare_dialog(c, cx).into_any_element());
+                d.child(
+                    div()
+                        .id("compare-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.45))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.comparing = None;
+                                cx.notify();
+                            }),
+                        )
+                        .children(dialog),
                 )
             })
             .when(self.confirm.is_some(), |d| {

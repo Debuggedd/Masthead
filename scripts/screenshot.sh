@@ -2,7 +2,7 @@
 # Launches a separate app instance at a given window size and captures just its window.
 # Needs Screen Recording permission for whatever runs this script (Terminal, T3 Code, ...).
 # usage: [MASTHEAD_OPEN="Nodes/production-worker#overview"] scripts/screenshot.sh out.png [WIDTHxHEIGHT] [seconds-to-wait]
-# MASTHEAD_OPEN: Kind[/name][#overview|yaml|logs|picker]
+# MASTHEAD_OPEN: Kind[/name][#overview|yaml|logs|picker|menu|compare]
 set -e
 out=${1:?usage: $0 out.png [WIDTHxHEIGHT] [wait]}
 size=${2:-1400x850}
