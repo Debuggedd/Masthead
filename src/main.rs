@@ -6732,6 +6732,27 @@ impl Explorer {
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(FAINT))
+            .child(
+                div()
+                    .id("pick-all")
+                    .flex_none()
+                    .w(px(PICK_W))
+                    .cursor_pointer()
+                    .tooltip(tip("Select all (⌘A)"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.view.is_empty() && this.picked.len() >= this.view.len() {
+                            this.picked.clear();
+                        } else {
+                            this.picked = this
+                                .view
+                                .iter()
+                                .map(|&i| (this.rows[i].ctx.clone(), this.rows[i].ns.clone(), this.rows[i].name.clone()))
+                                .collect();
+                        }
+                        cx.notify();
+                    }))
+                    .child(checkbox(!self.view.is_empty() && self.picked.len() >= self.view.len())),
+            )
             .children(self.shown.iter().map(|&i| {
                 let h = &cols[i];
                 let arrow = match self.sort() {
@@ -6803,7 +6824,33 @@ impl Explorer {
                                 .cursor_pointer()
                                 .when(on, |d| d.bg(rgb(SELECT)))
                                 .when(!on, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                                .group("table-row")
                                 .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| this.row_click(&key, ev.modifiers(), cx)))
+                                .child({
+                                    // Shown on hover, and on every row once something is picked. Toggles like ⌘-click
+                                    // (⇧ still picks a range); stopping the mouse-down keeps the row from opening.
+                                    let (picked, any) = (this.picked.contains(&row_key), !this.picked.is_empty());
+                                    let key = row_key.clone();
+                                    div()
+                                        .flex_none()
+                                        .w(px(PICK_W))
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .when(!any, |d| d.invisible().group_hover("table-row", |s| s.visible()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                let m = gpui::Modifiers {
+                                                    platform: !ev.modifiers.shift,
+                                                    ..ev.modifiers
+                                                };
+                                                this.row_click(&key, m, cx);
+                                            }),
+                                        )
+                                        .child(checkbox(picked))
+                                })
                                 .children(
                                     {
                                         let mut cells: Vec<Option<String>> = this.cells(r).into_iter().map(Some).collect();
@@ -7652,7 +7699,7 @@ impl Render for Explorer {
         }
         let main_w = window.viewport_size().width / px(1.) - SIDEBAR_W;
         self.detail_w = main_w;
-        let table_w = main_w - 24.;
+        let table_w = main_w - 24. - PICK_W;
         let cols = self.columns();
         self.shown = fit_columns(&cols, table_w);
         let fixed: f32 = self.shown.iter().filter_map(|&i| col_width(cols[i])).map(|w| w + COL_GAP).sum();
@@ -8153,6 +8200,9 @@ fn cell(header: &str, flex_w: f32) -> Div {
 }
 
 const COL_GAP: f32 = 12.;
+
+/// The checkbox column in front of each table row (bulk selection).
+const PICK_W: f32 = 15. + COL_GAP;
 
 /// Minimum width of the flexible (Name/Message) columns.
 const MIN_FLEX_W: f32 = 180.;
