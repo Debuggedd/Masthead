@@ -592,6 +592,7 @@ fn row_menu(
         )
         .separator();
 
+    let locked = view.upgrade().is_some_and(|v| v.read(cx).protected.contains(&key.0.name));
     // Open
     menu = menu
         .item(entry(
@@ -603,7 +604,7 @@ fn row_menu(
             open(Tab::Overview),
         ))
         .item(entry(
-            "Edit YAML".into(),
+            if locked { "View YAML" } else { "Edit YAML" }.into(),
             String::new(),
             "file-code",
             ACCENT,
@@ -690,7 +691,7 @@ fn row_menu(
                 cx.notify();
             }),
         ));
-        if k.name == "Pods" {
+        if k.name == "Pods" && !locked {
             menu = menu.item(entry(
                 "Debug container".into(),
                 debug_image(),
@@ -705,7 +706,7 @@ fn row_menu(
             ));
         }
     }
-    if k.name == "Nodes" {
+    if k.name == "Nodes" && !locked {
         let (ctx, node) = (key.0.clone(), key.2.clone());
         menu = menu.item(entry(
             "Node shell".into(),
@@ -788,7 +789,6 @@ fn row_menu(
     let mut actions: Vec<Action> = Action::quick(k, suspended).into_iter().filter(|a| *a != Action::Delete).collect();
     let mut autoscaled = None;
     let mut count = 0;
-    let locked = view.upgrade().is_some_and(|v| v.read(cx).protected.contains(&key.0.name));
     if locked {
         actions.retain(|a| a.harmless());
     }
@@ -2023,6 +2023,11 @@ impl Explorer {
             actions.insert(1, Action::Uncordon);
         }
         actions.push(Action::Delete);
+        // Any protected row: only what's allowed there (Flux reconciles, Compare) is offered.
+        let locked = self.picked.iter().any(|k| self.protected.contains(&k.0.name));
+        if locked {
+            actions.retain(|a| a.harmless());
+        }
         let compare = (self.picked.len() == 2).then(|| {
             button("bulk-compare", "arrow-left-right", "Compare", DIM).on_click(cx.listener(|this, _, _, cx| {
                 let mut keys = this.picked.iter().cloned();
@@ -2038,7 +2043,7 @@ impl Explorer {
                 cx.notify();
             }))
         });
-        let scale = scalable(kind.name).then(|| {
+        let scale = (scalable(kind.name) && !locked).then(|| {
             button("bulk-scale", "arrow-up-down", "Scale…", DIM).on_click(cx.listener(|this, _, _, cx| {
                 let keys: Vec<Key> = this.picked.iter().cloned().collect();
                 this.open_scale_modal(this.kind, keys, cx);
@@ -2069,7 +2074,7 @@ impl Explorer {
                     .text_color(rgb(FAINT))
                     .child("⌘-click toggle · ⇧-click range · ⌘A all"),
             )
-            .when(self.picked.iter().any(|k| self.protected.contains(&k.0.name)), |d| {
+            .when(locked, |d| {
                 d.child(
                     div()
                         .flex()
@@ -2078,7 +2083,7 @@ impl Explorer {
                         .text_xs()
                         .text_color(rgb(YELLOW))
                         .child(icon("lock", YELLOW).size(px(12.)))
-                        .child("protected rows are skipped"),
+                        .child("includes a protected context: changes are off"),
                 )
             })
             .child(div().flex_1())
@@ -7719,7 +7724,9 @@ impl Explorer {
     }
 
     fn yaml_editor(&self, ed: &YamlEditor, dirty: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = self.selected.as_ref().is_some_and(|k| self.protected.contains(&k.0.name));
         let (hint, hint_color) = match () {
+            _ if locked => ("Protected context: read-only (unlock it in the context switcher, ⌘K)", YELLOW),
             _ if ed.saving => ("Saving…", ACCENT),
             _ if dirty => ("● Unsaved changes", YELLOW),
             _ => ("Edit and press ⌘S to apply to the cluster", FAINT),
@@ -7759,11 +7766,13 @@ impl Explorer {
                     .when(dirty || ed.stale, |d| {
                         d.child(button("revert", "rotate-ccw", "Revert", DIM).on_click(cx.listener(|this, _, w, cx| this.reload_yaml(w, cx))))
                     })
-                    .child(
-                        button("save", "check", "Save  ⌘S", if dirty { TEXT } else { FAINT })
-                            .when(dirty, |b| b.bg(rgb(0x3d59a1)).border_color(rgb(ACCENT)))
-                            .on_click(cx.listener(|this, _, _, cx| this.save_yaml(cx))),
-                    ),
+                    .when(!locked, |d| {
+                        d.child(
+                            button("save", "check", "Save  ⌘S", if dirty { TEXT } else { FAINT })
+                                .when(dirty, |b| b.bg(rgb(0x3d59a1)).border_color(rgb(ACCENT)))
+                                .on_click(cx.listener(|this, _, _, cx| this.save_yaml(cx))),
+                        )
+                    }),
             )
             .when_some(ed.error.clone(), |d, e| d.child(notice(RED, 0x2a1a22, format!("Save failed: {e}"))))
             .when(ed.stale, |d| {
