@@ -12,7 +12,7 @@ use gpui_component::{
     Root, Sizable, Theme, ThemeMode,
     highlighter::{LanguageConfig, LanguageRegistry},
     input::{Input, InputEvent, InputState, SelectAll},
-    menu::{ContextMenuExt, PopupMenuItem},
+    menu::PopupMenuItem,
 };
 use k8s::{CACHE, Ctx, Kind, METRICS, Metrics, RT, Row, Usage, VERSION, kind as kind_at, kinds};
 use serde_json::Value;
@@ -1079,9 +1079,14 @@ struct Explorer {
     /// MASTHEAD_KEY_DELAY ms (default: one per frame); `wait:N` pauses N ms (screenshots, demos).
     pending_keys: std::collections::VecDeque<String>,
     next_key_at: Instant,
-    /// Screenshot hook (`MASTHEAD_OPEN=Kind/name#menu`): the row menu for this object, shown pinned.
-    debug_menu: Option<(usize, Key)>,
-    debug_menu_view: Option<Entity<gpui_component::menu::PopupMenu>>,
+    /// Right-click on a row: the menu to build next render (kind, row, where), then the open menu.
+    /// `MASTHEAD_OPEN=Kind/name#menu` opens one too (screenshots).
+    menu_request: Option<(usize, Key, gpui::Point<gpui::Pixels>)>,
+    row_menu: Option<(
+        Entity<gpui_component::menu::PopupMenu>,
+        gpui::Point<gpui::Pixels>,
+        gpui::Subscription,
+    )>,
     /// Overview (home) page: one summary card per selected cluster. The app opens here.
     home_mode: bool,
     /// Objects opened recently (newest first), shown in ⌘P before you type. Kind by name: CRD indices
@@ -1242,8 +1247,8 @@ impl Explorer {
                 .map(|k| k.split(',').map(String::from).collect())
                 .unwrap_or_default(),
             next_key_at: Instant::now(),
-            debug_menu: None,
-            debug_menu_view: None,
+            menu_request: None,
+            row_menu: None,
             home_mode: true,
             recent: Default::default(),
             picked: Default::default(),
@@ -1743,7 +1748,7 @@ impl Explorer {
                 "events" => Tab::Events,
                 "map" => Tab::Map,
                 "menu" => {
-                    self.debug_menu = Some((self.kind, key.clone()));
+                    self.menu_request = Some((self.kind, key.clone(), gpui::point(px(520.), px(140.))));
                     return cx.notify();
                 }
                 "forward" => {
@@ -6891,19 +6896,12 @@ impl Explorer {
                                         _ => value_cell(h, v, this.flex_w).into_any_element(),
                                     }),
                                 )
-                                .context_menu({
-                                    let (view, key) = (cx.entity().downgrade(), row_key.clone());
-                                    let suspended = suspended(&r.obj);
-                                    let urls: Vec<String> = if cur_kind == kind_ix("Ingresses") {
-                                        let mut urls: Vec<String> = ingress_routes(&r.obj).into_iter().map(|(u, ..)| u).collect();
-                                        urls.dedup();
-                                        urls
-                                    } else {
-                                        vec![]
-                                    };
-                                    move |menu, window, cx| {
-                                        row_menu(menu, view.clone(), cur_kind, key.clone(), suspended, urls.clone(), window, cx)
-                                    }
+                                .on_mouse_down(MouseButton::Right, {
+                                    let key = row_key.clone();
+                                    cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                        this.menu_request = Some((cur_kind, key.clone(), ev.position));
+                                        cx.notify();
+                                    })
                                 })
                         })
                         .collect()
@@ -7677,15 +7675,27 @@ impl Render for Explorer {
         self.sync_ns_search(window, cx);
         self.sync_logs(window, cx);
         self.sync_helm_text(window, cx);
-        if let Some((kind, key)) = self.debug_menu.take() {
+        if let Some((kind, key, at)) = self.menu_request.take() {
+            let row = self.cached_row(kind, &key);
+            let suspended = row.as_ref().is_some_and(|r| suspended(&r.obj));
+            let mut urls: Vec<String> = match &row {
+                Some(r) if kind == kind_ix("Ingresses") => ingress_routes(&r.obj).into_iter().map(|(u, ..)| u).collect(),
+                _ => vec![],
+            };
+            urls.dedup();
             // Built after this render: the menu reads our state, which is leased while rendering.
             let view = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
                 let menu = gpui_component::menu::PopupMenu::build(window, cx, |menu, window, cx| {
-                    row_menu(menu, view.clone(), kind, key, false, vec![], window, cx)
+                    row_menu(menu, view.clone(), kind, key, suspended, urls, window, cx)
                 });
+                menu.focus_handle(cx).focus(window);
                 view.update(cx, |this, cx| {
-                    this.debug_menu_view = Some(menu);
+                    let closed = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+                        (this.row_menu, this.refocus) = (None, true);
+                        cx.notify();
+                    });
+                    this.row_menu = Some((menu, at, closed));
                     cx.notify();
                 })
                 .ok();
@@ -7998,8 +8008,33 @@ impl Render for Explorer {
                         .child(self.ctx_picker(cx)),
                 )
             })
-            .when_some(self.debug_menu_view.clone(), |d, menu| {
-                d.child(div().absolute().top(px(140.)).left(px(520.)).child(menu))
+            .when_some(self.row_menu.as_ref(), |d, (menu, at, _)| {
+                // A plain shadowed popup at the pointer; the backdrop keeps clicks from reaching the rows.
+                d.child(
+                    gpui::deferred(
+                        div()
+                            .id("menu-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .occlude()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, _, _, cx| {
+                                    (this.row_menu, this.refocus) = (None, true);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                gpui::anchored()
+                                    .position(*at)
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(menu.clone()),
+                            ),
+                    )
+                    .with_priority(1),
+                )
             })
             .when_some(self.palette.clone(), |d, input| {
                 let palette = self.palette_view(&input, cx).into_any_element();
