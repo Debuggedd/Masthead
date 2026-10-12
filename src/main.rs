@@ -237,6 +237,8 @@ macro_rules! icons {
 }
 icons!(
     "activity",
+    "arrow-down-to-line",
+    "ban",
     "archive",
     "arrow-left",
     "box",
@@ -371,6 +373,9 @@ enum Action {
     Resume,
     /// Set spec.replicas (from the Scale dialog).
     ScaleTo(i64),
+    Cordon,
+    Uncordon,
+    Drain,
 }
 
 /// Kinds whose replica count can be set directly.
@@ -383,7 +388,8 @@ fn replicas(obj: &Value) -> i64 {
 }
 
 impl Action {
-    /// Kind-specific actions (Delete is added separately). `suspended` picks Suspend vs Resume for Flux.
+    /// Kind-specific actions (Delete is added separately). `suspended` picks Suspend vs Resume for Flux,
+    /// Cordon vs Uncordon for nodes.
     fn quick(kind: &Kind, suspended: bool) -> Vec<Action> {
         if kind.is_flux() {
             let with_source = matches!(kind.kind, "Kustomization" | "HelmRelease");
@@ -396,6 +402,7 @@ impl Action {
             "Pods" | "Jobs" => vec![Action::Delete],
             "Deployments" | "StatefulSets" | "DaemonSets" => vec![Action::Redeploy],
             "CronJobs" => vec![Action::Trigger],
+            "Nodes" => vec![if suspended { Action::Uncordon } else { Action::Cordon }, Action::Drain],
             _ => vec![],
         }
     }
@@ -410,6 +417,9 @@ impl Action {
             Action::Suspend => "Suspend",
             Action::Resume => "Resume",
             Action::ScaleTo(_) => "Scale",
+            Action::Cordon => "Cordon",
+            Action::Uncordon => "Uncordon",
+            Action::Drain => "Drain",
         }
     }
 
@@ -423,6 +433,9 @@ impl Action {
             Action::Suspend => "pause",
             Action::Resume => "play",
             Action::ScaleTo(_) => "arrow-up-down",
+            Action::Cordon => "ban",
+            Action::Uncordon => "circle-check",
+            Action::Drain => "arrow-down-to-line",
         }
     }
 
@@ -802,8 +815,9 @@ fn flux_failing(cond: &Value, now: i64, grace: i64) -> bool {
         && k8s::ts(cond, "/lastTransitionTime").is_some_and(|since| now - since >= grace)
 }
 
+/// A suspended Flux object or CronJob, or a cordoned node.
 fn suspended(obj: &Value) -> bool {
-    obj.pointer("/spec/suspend") == Some(&Value::Bool(true))
+    [obj.pointer("/spec/suspend"), obj.pointer("/spec/unschedulable")].contains(&Some(&Value::Bool(true)))
 }
 
 /// Plain text tooltip (GPUI tooltips are views).
@@ -1923,6 +1937,9 @@ impl Explorer {
         if kind.is_flux() {
             actions.push(Action::Resume);
         }
+        if kind.name == "Nodes" {
+            actions.insert(1, Action::Uncordon);
+        }
         actions.push(Action::Delete);
         let scale = scalable(kind.name).then(|| {
             button("bulk-scale", "arrow-up-down", "Scale…", DIM).on_click(cx.listener(|this, _, _, cx| {
@@ -2116,7 +2133,7 @@ impl Explorer {
             let nodes = kind_ix("Nodes");
             for r in rows(ctx, nodes) {
                 let conds = k8s::arr(&r.obj, "/status/conditions");
-                if r.cells[0] != "Ready" {
+                if r.cells[0] == "NotReady" {
                     let m = conds
                         .iter()
                         .find(|c| c["type"] == "Ready")
@@ -2964,6 +2981,7 @@ impl Explorer {
             Action::Delete if kind.name == "Pods" => "Its controller (if any) will start a replacement.",
             Action::Delete => "This can't be undone.",
             Action::Redeploy => "Pods are replaced one at a time (rolling restart).",
+            Action::Drain => "Cordons it, then evicts its pods, respecting disruption budgets. DaemonSet pods stay.",
             _ => "",
         };
         let danger = c.action == Action::Delete;
@@ -4658,7 +4676,7 @@ impl Explorer {
     }
 
     fn act_many(&mut self, action: Action, kind: usize, keys: Vec<Key>, cx: &mut Context<Self>) {
-        let risky = matches!(action, Action::Delete | Action::Redeploy);
+        let risky = matches!(action, Action::Delete | Action::Redeploy | Action::Drain);
         if risky && self.prefs.confirm && !keys.is_empty() {
             self.confirm = Some(Confirm { action, kind, keys });
             self.refocus = true; // so Enter / Esc reach the dialog
@@ -4769,6 +4787,20 @@ impl Explorer {
                 ))
                 .await
                 .map(|_| format!("Scaled {what} to {scale_to}")),
+                Action::Cordon | Action::Uncordon => {
+                    let on = action == Action::Cordon;
+                    run(k8s::patch(
+                        ctx,
+                        kind,
+                        ns,
+                        name,
+                        serde_json::json!({"spec": {"unschedulable": on}}),
+                        false,
+                    ))
+                    .await
+                    .map(|_| format!("{} {what}", if on { "Cordoned" } else { "Uncordoned" }))
+                }
+                Action::Drain => run(k8s::drain(ctx, name)).await.map(|msg| format!("Drained {what}: {msg}")),
                 Action::Resume => {
                     // Like `flux resume`: unsuspend and ask for a reconcile right away.
                     let mut patch = k8s::reconcile_patch();
@@ -8201,7 +8233,7 @@ fn value_cell(header: &str, v: String, flex_w: f32) -> Div {
 fn status_color(v: &str) -> Option<Hsla> {
     let c = match v {
         "Running" | "Ready" | "Active" | "Bound" | "Normal" | "True" => GREEN,
-        "Unknown" | "Suspended" => YELLOW,
+        "Unknown" | "Suspended" | "Cordoned" => YELLOW,
         "False" => RED,
         // Finished is fine but not "alive"; grey keeps it apart from running things.
         "Complete" | "Completed" | "Succeeded" => DIM,

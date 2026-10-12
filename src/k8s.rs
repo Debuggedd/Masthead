@@ -3,7 +3,7 @@ use futures::StreamExt;
 use k8s_openapi::{api::core::v1::Pod, apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition, jiff::Timestamp};
 use kube::{
     Api, Client, Config,
-    api::{ApiResource, DeleteParams, DynamicObject, LogParams, Patch, PatchParams, PostParams},
+    api::{ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, LogParams, Patch, PatchParams, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
     runtime::{WatchStreamExt, watcher, watcher::Event},
 };
@@ -1025,6 +1025,81 @@ pub async fn patch(ctx: Ctx, kind: &'static Kind, ns: String, name: String, patc
     Ok(())
 }
 
+/// Like `kubectl drain --ignore-daemonsets --delete-emptydir-data`: cordon, then evict the node's pods
+/// through the Eviction API, so PodDisruptionBudgets are respected (a blocked eviction is retried for up
+/// to 5 minutes). Running pods without a controller would be gone for good, so they're left on the node
+/// (kubectl wants --force for those). Doesn't wait for evicted pods to finish terminating.
+pub async fn drain(ctx: Ctx, node: String) -> Result<String> {
+    let c = client(&ctx).await?;
+    let unschedulable = json!({"spec": {"unschedulable": true}});
+    Api::<k8s_openapi::api::core::v1::Node>::all(c.clone())
+        .patch(&node, &PatchParams::default(), &Patch::Merge(&unschedulable))
+        .await?;
+    let pods = Api::<Pod>::all(c.clone())
+        .list(&ListParams::default().fields(&format!("spec.nodeName={node}")))
+        .await?;
+    let (mut todo, mut kept) = (vec![], vec![]);
+    for pod in pods {
+        let Some(evict) = drain_action(&pod) else { continue };
+        let (ns, name) = (pod.metadata.namespace.unwrap_or_default(), pod.metadata.name.unwrap_or_default());
+        if evict {
+            todo.push((ns, name))
+        } else {
+            kept.push(format!("{ns}/{name}"))
+        }
+    }
+    // Evict everything; pods a disruption budget protects right now (429) are retried every 5 seconds
+    // until their replacements are up elsewhere, for at most 5 minutes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let (total, mut blocked) = (todo.len(), String::new());
+    loop {
+        let mut retry = vec![];
+        for (ns, name) in todo {
+            match Api::<Pod>::namespaced(c.clone(), &ns).evict(&name, &EvictParams::default()).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(kube::Error::Api(e)) if e.code == 429 => {
+                    let cause = e.details.iter().flat_map(|d| &d.causes).next().map(|c| c.message.clone());
+                    blocked = cause.unwrap_or(e.message);
+                    retry.push((ns, name));
+                }
+                Err(e) => anyhow::bail!("evicting {ns}/{name}: {e} (node stays cordoned)"),
+            }
+        }
+        todo = retry;
+        if todo.is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    if !todo.is_empty() {
+        let pods: Vec<String> = todo.iter().map(|(ns, name)| format!("{ns}/{name}")).collect();
+        anyhow::bail!("gave up after 5 minutes on {}: {blocked} (node stays cordoned)", pods.join(", "));
+    }
+    let evicted = total;
+    let mut msg = format!("{evicted} pod{} evicted", if evicted == 1 { "" } else { "s" });
+    if !kept.is_empty() {
+        msg += &format!("; kept {} without a controller", kept.join(", "));
+    }
+    Ok(msg)
+}
+
+/// What draining does with a pod: None = leave it (DaemonSet or static pod), Some(true) = evict,
+/// Some(false) = keep, because nothing would recreate it.
+fn drain_action(pod: &Pod) -> Option<bool> {
+    let owner = pod.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true));
+    let mirror = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key("kubernetes.io/config.mirror"));
+    if mirror || owner.is_some_and(|o| o.kind == "DaemonSet") {
+        return None;
+    }
+    let done = matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed"));
+    Some(owner.is_some() || done)
+}
+
 /// Same as `flux reconcile`: Flux controllers act on a changed requestedAt annotation.
 pub fn reconcile_patch() -> Value {
     json!({"metadata": {"annotations": {"reconcile.fluxcd.io/requestedAt": Timestamp::now().to_string()}}})
@@ -1347,7 +1422,12 @@ fn cells(kind: &Kind, v: &Value) -> Vec<String> {
                 .flat_map(|m| m.keys())
                 .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
                 .collect();
-            let status = if ready { "Ready" } else { "NotReady" };
+            let cordoned = v.pointer("/spec/unschedulable") == Some(&Value::Bool(true));
+            let status = match (ready, cordoned) {
+                (false, _) => "NotReady",
+                (true, true) => "Cordoned",
+                (true, false) => "Ready",
+            };
             vec![status.into(), roles.join(",")]
         }
         "Namespace" => vec![s(v, "/status/phase")],
@@ -1456,6 +1536,28 @@ fn cells(kind: &Kind, v: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_picks() {
+        let pod = |owner: &str, phase: &str, mirror: bool| -> Pod {
+            serde_json::from_value(json!({
+                "metadata": {
+                    "name": "p",
+                    "ownerReferences": if owner.is_empty() { json!([]) } else {
+                        json!([{"apiVersion": "apps/v1", "kind": owner, "name": "o", "uid": "u", "controller": true}])
+                    },
+                    "annotations": if mirror { json!({"kubernetes.io/config.mirror": "x"}) } else { json!({}) },
+                },
+                "status": {"phase": phase},
+            }))
+            .unwrap()
+        };
+        assert_eq!(drain_action(&pod("ReplicaSet", "Running", false)), Some(true));
+        assert_eq!(drain_action(&pod("DaemonSet", "Running", false)), None);
+        assert_eq!(drain_action(&pod("", "Running", true)), None);
+        assert_eq!(drain_action(&pod("", "Running", false)), Some(false));
+        assert_eq!(drain_action(&pod("", "Succeeded", false)), Some(true));
+    }
 
     #[test]
     fn pod_cells() {
