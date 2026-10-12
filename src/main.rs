@@ -870,6 +870,16 @@ fn flux_failing(cond: &Value, now: i64, grace: i64) -> bool {
         && k8s::ts(cond, "/lastTransitionTime").is_some_and(|since| now - since >= grace)
 }
 
+/// The object is healthy and became so at or after `t`, so a warning from before then is resolved: its
+/// Ready condition (pods, nodes, Flux), Available (Deployments) or ScalingActive (HPAs) turned True since.
+fn ready_since(obj: &Value, t: i64) -> bool {
+    k8s::arr(obj, "/status/conditions").iter().any(|c| {
+        ["Ready", "Available", "ScalingActive"].contains(&c["type"].as_str().unwrap_or_default())
+            && c["status"] == "True"
+            && k8s::ts(c, "/lastTransitionTime").is_some_and(|at| at >= t)
+    })
+}
+
 /// A suspended Flux object or CronJob, or a cordoned node.
 fn suspended(obj: &Value) -> bool {
     [obj.pointer("/spec/suspend"), obj.pointer("/spec/unschedulable")].contains(&Some(&Value::Bool(true)))
@@ -2349,7 +2359,8 @@ impl Explorer {
                     }
                 }
             }
-            // Warning events from the last 30 minutes, one entry per object (latest wins, counts summed).
+            // Warning events from the last 30 minutes, one entry per object (latest wins, counts summed),
+            // unless the object has since become Ready or is gone (replaced or deleted).
             let mut warned: HashMap<(String, String, String), (Arc<Row>, i64)> = HashMap::new();
             for e in rows(ctx, kind_ix("Events")) {
                 if s(&e.obj, "/type") != "Warning" || now - e.created > 1800 {
@@ -2368,8 +2379,12 @@ impl Explorer {
             for ((kind, ns, name), (e, count)) in warned {
                 // Point at the object itself when we know its kind; otherwise at the event.
                 let target = k8s::find_kind(|k| k.kind == kind && !k.custom).or_else(|| k8s::find_kind(|k| k.kind == kind));
-                let (kix, row) = match target.and_then(|ix| rows(ctx, ix).find(|r| r.ns == ns && r.name == name).map(|r| (ix, r.clone()))) {
-                    Some(found) => found,
+                let slot = target.and_then(|ix| Some((ix, cache.get(&(ctx.clone(), ix)).filter(|s| s.synced)?)));
+                let (kix, row) = match slot {
+                    Some((ix, slot)) => match slot.rows.get(&(ns, name)) {
+                        Some(r) if !ready_since(&r.obj, e.created) => (ix, r.clone()),
+                        _ => continue,
+                    },
                     None => (events, e.clone()),
                 };
                 let times = if count > 1 { format!(" ×{count}") } else { String::new() };
@@ -10387,6 +10402,24 @@ fn live_helm_decode() {
         k8s::s(&sample, "/info/notes").len()
     );
     handle.abort();
+}
+
+#[test]
+fn ready_since_resolves_older_warnings() {
+    let pod = serde_json::json!({"status": {"conditions": [
+        {"type": "Ready", "status": "True", "lastTransitionTime": "2026-01-01T10:00:00Z"}
+    ]}});
+    let at = |t: &str| t.parse::<k8s_openapi::jiff::Timestamp>().unwrap().as_second();
+    assert!(
+        ready_since(&pod, at("2026-01-01T09:59:00Z")),
+        "probe failed during startup, Ready since"
+    );
+    assert!(
+        !ready_since(&pod, at("2026-01-01T10:05:00Z")),
+        "still failing after it became Ready"
+    );
+    let unready = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "False"}]}});
+    assert!(!ready_since(&unready, 0));
 }
 
 #[test]
