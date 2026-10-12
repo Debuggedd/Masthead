@@ -50,11 +50,17 @@ and it idles at around 1% CPU.
   chart defaults, the rendered manifest and notes.
 - **Edit YAML** in a syntax-highlighted editor. Saves are conflict-safe.
 - **Actions.** Right-click for delete, rolling redeploy, scale, trigger a CronJob, port forward, open a
-  shell (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Bulk actions work on
-  multi-selected rows. Scale opens a small dialog for the replica count; workloads scaled by an HPA (or
-  KEDA) link to it instead, so you don't fight the autoscaler.
+  shell (in [Ghostty](https://ghostty.org) or Terminal) and copy as `kubectl`. Nodes can be cordoned,
+  uncordoned and drained. Tick rows' checkboxes for bulk actions. Scale opens a small dialog for the
+  replica count; workloads scaled by an HPA (or KEDA) link to it instead, so you don't fight the
+  autoscaler.
+- **Compare across clusters or namespaces.** Right-click → Compare with (or pick two rows) to see what
+  differs between, say, staging and production. Only what you configure is compared (spec, data, your
+  own labels and annotations), list items are matched by name, secret values are compared without being
+  shown, and the cluster and namespace names can be ignored so `api.staging…` equals `api.prod…`.
 - **Protected contexts.** Click the lock next to a context in the switcher (⌘K) to turn off deletes,
-  scaling, redeploys, triggers, suspend/resume and YAML saves there. Flux reconciles still work.
+  scaling, redeploys, cordon/drain, triggers, suspend/resume, YAML saves, debug containers and node
+  shells there; they disappear from menus and the bulk bar. Flux reconciles still work.
 - **Confirmations.** Deletes and redeploys (also in bulk) ask first in a small dialog: Enter confirms, Esc
   cancels. You can turn this off in Settings.
 - **Secrets** stay masked until you click the eye icon.
@@ -131,7 +137,7 @@ context switcher at the top left (⌘K) to tick contexts or add more kubeconfig 
 | ⌘, | settings |
 | ↑ ↓ / Enter | select / open |
 | Esc, ⌘[ | back / clear filter / clear selection |
-| ⌘-click, ⇧-click, ⌘A | multi-select rows for bulk actions |
+| ⌘-click, ⇧-click, ⌘A | multi-select rows for bulk actions (or tick their checkboxes) |
 | ⌘S | save in the YAML editor |
 | ⌘R | reconnect |
 
@@ -177,6 +183,9 @@ Settings are stored in `~/Library/Application Support/Masthead/`.
 - **Debug shells**: on a pod, "Debug container" adds an ephemeral busybox container that shares the target
   container's processes (`kubectl debug`), for images without a shell. On a node, "Node shell" starts a
   privileged pod on that node and enters the host as root; the pod is removed when you exit.
+- **Drain**: cordons the node, then evicts its pods through the Eviction API, so PodDisruptionBudgets are
+  respected (blocked pods are retried for up to 5 minutes). DaemonSet and static pods stay, and so do
+  running pods without a controller, since nothing would recreate them.
 - **Flux**: Reconcile, Reconcile with source (refreshes the GitRepository, OCIRepository, HelmRepository
   or HelmChart first), Suspend and Resume. Kustomizations and HelmReleases list their managed objects.
 - **Secrets / ConfigMaps**: every key is listed, and values can be selected and scrolled. Secret values
@@ -209,7 +218,7 @@ live in your real home directory.
 Debug hooks used by those scripts:
 
 - `MASTHEAD_SIZE=WxH` opens a floating window of that size.
-- `MASTHEAD_OPEN=Kind/name#tab` opens a page. It also accepts `Overview`, `Problems`, `Helm/name`, `Search:query` and `#menu`.
+- `MASTHEAD_OPEN=Kind/name#tab` opens a page. It also accepts `Overview`, `Problems`, `Helm/name`, `Search:query`, `#menu` and `#compare` (with the same object in another cluster or namespace).
 - `MASTHEAD_KEYS=a,b,cmd-p,wait:500` replays keystrokes.
 - `MASTHEAD_APPEARANCE=dark` forces light or dark mode.
 - `MASTHEAD_RELEASES_URL=file:///path/latest.json` checks a fake release instead of GitHub (tests the updater).
