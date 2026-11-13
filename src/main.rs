@@ -5,9 +5,9 @@ mod update;
 
 use gpui::{
     AnyElement, AnyView, App, Application, AssetSource, Bounds, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, KeyBinding, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, PathPromptOptions,
+    FontWeight, Hsla, KeyBinding, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions,
     ScrollStrategy, SharedString, Stateful, Svg, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
-    actions, div, point, prelude::*, px, relative, rems, size, svg, uniform_list,
+    actions, canvas, div, point, prelude::*, px, relative, rems, size, svg, uniform_list,
 };
 use gpui_component::{
     Root, Sizable, Theme, ThemeMode,
@@ -1123,6 +1123,10 @@ struct Explorer {
     log_view: Vec<(usize, std::ops::Range<usize>)>,
     /// Row of the longest line (sets the scroll width when not wrapping).
     log_widest: usize,
+    /// Selected log lines (anchor, head) as indices into the stream's lines; drag or shift-click to extend.
+    log_sel: Option<(usize, usize)>,
+    /// Runs while a log selection is being dragged: follows the pointer and auto-scrolls past the edges.
+    log_drag: Option<Task<()>>,
     list_scroll: UniformListScrollHandle,
     picker_open: bool,
     forwards: Vec<FwdEntry>,
@@ -1300,6 +1304,8 @@ impl Explorer {
             log_scroll: UniformListScrollHandle::new(),
             log_view: vec![],
             log_widest: 0,
+            log_sel: None,
+            log_drag: None,
             list_scroll: UniformListScrollHandle::new(),
             picker_open: false,
             forwards: vec![],
@@ -4636,6 +4642,7 @@ impl Explorer {
         let Some(row) = row else {
             self.logs = None;
             self.log_search = None;
+            self.log_drag = None;
             return;
         };
         let containers = self.log_containers(&row);
@@ -4665,6 +4672,7 @@ impl Explorer {
             );
             self.logs = Some(LogSession { key, stream, seen: 0 });
             self.log_follow = true;
+            self.log_sel = None;
         }
         if self.log_search.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter… (!exclude, /regex/)"));
@@ -4738,7 +4746,7 @@ impl Explorer {
 
     /// Writes the shown (filtered) lines to ~/Downloads and reveals the file in Finder.
     fn save_logs(&mut self, cx: &mut Context<Self>) {
-        let text = self.log_text();
+        let text = self.log_text(0..=usize::MAX);
         let name = self.selected.as_ref().map_or("logs".to_string(), |k| k.2.clone());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4764,16 +4772,76 @@ impl Explorer {
         cx.notify();
     }
 
-    /// The filtered log lines as text (for Copy).
-    fn log_text(&self) -> String {
+    /// The filtered log lines within `only` (stream line indices) as text (for Copy).
+    fn log_text(&self, only: std::ops::RangeInclusive<usize>) -> String {
         let Some(session) = &self.logs else { return String::new() };
         let lines = session.stream.lines.lock().unwrap();
         self.log_view
             .iter()
-            .filter(|(_, r)| r.start == 0)
+            .filter(|(i, r)| r.start == 0 && only.contains(i))
             .map(|(i, _)| lines[*i].text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The selected log lines (stream indices), or all of them when nothing is selected.
+    // ponytail: whole lines only; GPUI divs have no text selection, so partial lines would need a text editor view.
+    fn log_sel_range(&self) -> std::ops::RangeInclusive<usize> {
+        self.log_sel.map_or(0..=usize::MAX, |(a, h)| a.min(h)..=a.max(h))
+    }
+
+    /// "N log lines" for the selection, for the status bar.
+    fn log_sel_label(&self) -> String {
+        let range = self.log_sel_range();
+        let n = self.log_view.iter().filter(|(i, r)| r.start == 0 && range.contains(i)).count();
+        format!("{n} log line{}", if n == 1 { "" } else { "s" })
+    }
+
+    /// ⌘C: copies the selected log lines.
+    fn copy_log_selection(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(self.log_text(self.log_sel_range())));
+        self.status = format!("{} copied", self.log_sel_label());
+        cx.notify();
+    }
+
+    /// Starts a log selection drag at stream line `li`; it ends on mouse up (see the canvas in `logs_view`).
+    fn start_log_drag(&mut self, li: usize, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus); // so ⌘C reaches on_key
+        let anchor = self.log_sel.filter(|_| shift).map_or(li, |(a, _)| a);
+        self.log_sel = Some((anchor, li));
+        self.log_drag = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(30)).await;
+                if this.update_in(cx, |this, window, cx| this.log_drag_tick(window, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Extends the selection to the row under the pointer. Above or below the list that row is off screen,
+    /// and scrolling it into view is the auto-scroll: the further out the pointer, the faster it goes.
+    fn log_drag_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let (Some((anchor, head)), Some(last)) = (self.log_sel, self.log_view.len().checked_sub(1)) else {
+            return;
+        };
+        let handle = self.log_scroll.0.borrow().base_handle.clone();
+        let (bounds, y) = (handle.bounds(), window.mouse_position().y);
+        let vi = ((y - bounds.top() - handle.offset().y) / px(18.)).floor().clamp(0., last as f32) as usize;
+        if y < bounds.top() {
+            self.log_follow = false; // or Follow yanks it back to the bottom
+            self.log_scroll.scroll_to_item(vi, ScrollStrategy::Top);
+            cx.notify();
+        } else if y > bounds.bottom() {
+            self.log_scroll.scroll_to_item(vi, ScrollStrategy::Bottom);
+            cx.notify();
+        }
+        let li = self.log_view[vi].0;
+        if li != head {
+            self.log_sel = Some((anchor, li));
+            cx.notify();
+        }
     }
 
     fn logs_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4938,11 +5006,11 @@ impl Explorer {
                         let Some(session) = &this.logs else { return vec![] };
                         let lines = session.stream.lines.lock().unwrap();
                         let many = session.stream.pods.len() > 1;
+                        let sel = this.log_sel.map(|(a, h)| a.min(h)..=a.max(h));
                         range
                             .filter_map(|vi| {
                                 let (li, part) = this.log_view.get(vi)?.clone();
                                 let line = lines.get(li)?;
-                                let text = line.text.clone();
                                 let first = part.start == 0;
                                 // Pod tag: the hash suffix tells replicas apart.
                                 let pod = session
@@ -4951,7 +5019,7 @@ impl Explorer {
                                     .get(line.pod)
                                     .map(|p| p.rsplit('-').next().unwrap_or(p).to_string());
                                 let color = CTX_COLORS[line.pod % CTX_COLORS.len()];
-                                let warn = text.starts_with('⚠');
+                                let warn = line.text.starts_with('⚠');
                                 Some(
                                     div()
                                         .id(("log", vi))
@@ -4962,11 +5030,14 @@ impl Explorer {
                                         .whitespace_nowrap()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgb(HOVER)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                                            this.status = "Log line copied".into();
-                                            cx.notify();
-                                        }))
+                                        .when(sel.as_ref().is_some_and(|s| s.contains(&li)), |d| d.bg(rgb(SELECT)))
+                                        // Click selects a line, drag or shift-click a range; ⌘C or Copy copies it.
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                                this.start_log_drag(li, ev.modifiers.shift, window, cx)
+                                            }),
+                                        )
                                         .child(
                                             div()
                                                 .flex_none()
@@ -5010,6 +5081,26 @@ impl Explorer {
                     }
                 }))
                 .into_any_element()
+            })
+            // Ends a selection drag wherever the button comes up (row listeners only hear it over a row).
+            .child({
+                let this = cx.entity().downgrade();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                            if phase == gpui::DispatchPhase::Bubble && ev.button == MouseButton::Left {
+                                _ = this.update(cx, |this, cx| {
+                                    if this.log_drag.take().is_some() {
+                                        this.status = format!("{} selected · ⌘C to copy", this.log_sel_label());
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        })
+                    },
+                )
+                .size_0()
             })
     }
 
@@ -6553,6 +6644,9 @@ impl Explorer {
         // Any key other than select-all/copy drops the selection.
         let all = std::mem::take(&mut self.filter_all);
         match ks.key.as_str() {
+            "c" if cmd && self.tab == Tab::Logs && self.selected.is_some() && self.log_sel.is_some() => {
+                return self.copy_log_selection(cx);
+            }
             "a" if cmd && self.filter.is_empty() && self.selected.is_none() && !self.problems_mode && !self.helm_mode => {
                 self.picked = self
                     .view
@@ -7878,7 +7972,7 @@ impl Explorer {
                             .child(icon_button("copy", "copy", DIM, "Copy").on_click(cx.listener(|this, _, _, cx| {
                                 let text = match (this.tab, this.current_editor()) {
                                     (Tab::Yaml, Some(ed)) => ed.state.read(cx).value().to_string(),
-                                    (Tab::Logs, _) => this.log_text(),
+                                    (Tab::Logs, _) => this.log_text(this.log_sel_range()),
                                     _ => this.selected_row().map(|r| yaml_text(r)).unwrap_or_default(),
                                 };
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
